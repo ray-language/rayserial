@@ -19,7 +19,13 @@ pub struct Stats {
 
 /// "1048576 bytes in 812 ms (1291.3 KB/s)"
 pub fn rate_line(n: int, ms: int) -> string {
-    let kbs = if (ms <= 0) { 0 } else { (n * 10000 / 1024) / ms };
+    if (ms <= 0) {
+        return "${n} bytes in ${ms} ms";
+    }
+    let kbs = (n * 10000 / 1024) / ms;
+    if (kbs < 10) {
+        return "${n} bytes in ${ms} ms (${n * 1000 / ms} B/s)";
+    }
     "${n} bytes in ${ms} ms (${kbs / 10}.${kbs % 10} KB/s)"
 }
 
@@ -137,6 +143,9 @@ pub fn capture(p: Port, o: CaptureOptions) -> Result<Stats, string> {
             },
         };
         if (ready.len() == 0) {
+            // On the VM a signal reaches signals() only while the fiber parks:
+            // an FFI poll does not park it, a real sleep does (1 ms when idle).
+            time.sleep(1);
             continue;
         }
         let want = if (o.max_bytes > 0) { min_int(65536, o.max_bytes - got) } else { 65536 };

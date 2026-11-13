@@ -264,6 +264,9 @@ pub fn run(o: BoardOptions) -> Result<int, string> {
         }
         let ready = sys.poll_fds([m], [sys.POLLIN], 20)?;
         if (ready.len() == 0 || (ready[0] & sys.POLLIN) == 0) {
+            // On the VM a signal reaches signals() only while the fiber parks:
+            // an FFI poll does not park it, a real sleep does (1 ms when idle).
+            time.sleep(1);
             continue;
         }
         match (sys.read_chunk(m, want)) {
@@ -285,7 +288,13 @@ pub fn run(o: BoardOptions) -> Result<int, string> {
                         source_sent = 0;
                     }
                 } else {
-                    let reply = sketch_feed(sketch, b, speed);
+                    // read the speed again: the client may have changed it while we
+                    // were waiting in poll
+                    let now_speed = match (pty.peer_config(m)) {
+                        Result.Ok(c) => c.baud,
+                        Result.Err(_) => speed,
+                    };
+                    let reply = sketch_feed(sketch, b, now_speed);
                     emit(m, reply, 2000);
                 }
             },

@@ -361,4 +361,5 @@ fn timestamps_prefix_each_line() {
     assert_eq(b, b"o\n");
     assert(st2);
     assert_eq(transfer.rate_line(2048, 1000), "2048 bytes in 1000 ms (2.0 KB/s)");
+    assert_eq(transfer.rate_line(132, 2000), "132 bytes in 2000 ms (66 B/s)");
 }

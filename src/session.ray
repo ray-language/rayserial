@@ -120,6 +120,10 @@ fn show_local_echo(st: State, b: bytes, o: SessionOptions) {
 /// The loop. Ends on Ctrl-A x, on --for, when the port goes away, or when
 /// stdin ends (only if it is not a terminal: `echo cmd | rayserial open`).
 fn pump(p: Port, o: SessionOptions) -> Result<int, string> {
+    // printed once the terminal is raw: from here on every key counts
+    if (!o.quiet) {
+        say("${status_line(p)}\r\n*** Ctrl-A x quits, Ctrl-A ? lists the keys\r\n");
+    }
     let st = State {
         mode: Mode.Normal,
         hex: o.hex,
@@ -170,22 +174,23 @@ fn pump(p: Port, o: SessionOptions) -> Result<int, string> {
     Result.Ok(st.sent)
 }
 
-/// Runs the session; the local terminal is raw while it lasts (when stdin
-/// is a terminal at all).
-pub fn run(p: Port, o: SessionOptions) -> Result<int, string> {
-    if (!o.quiet) {
-        say("${status_line(p)}\r\n*** Ctrl-A x quits, Ctrl-A ? lists the keys\r\n");
-    }
-    let r = if (term.is_tty(0)) {
-        match (term.raw(fn() -> Result<int, string> { pump(p, o) })) {
-            Result.Ok(inner) => inner,
-            Result.Err(e) => Result.Err("raw mode: ${e}"),
-        }
-    } else {
-        pump(p, o)
-    };
+/// The loop plus the goodbye, both while the terminal is still raw.
+fn session(p: Port, o: SessionOptions) -> Result<int, string> {
+    let r = pump(p, o);
     if (!o.quiet) {
         say("\r\n*** rayserial: bye\r\n");
     }
     r
+}
+
+/// Runs the session; the local terminal is raw while it lasts (when stdin
+/// is a terminal at all).
+pub fn run(p: Port, o: SessionOptions) -> Result<int, string> {
+    if (!term.is_tty(0)) {
+        return session(p, o);
+    }
+    match (term.raw(fn() -> Result<int, string> { session(p, o) })) {
+        Result.Ok(inner) => inner,
+        Result.Err(e) => Result.Err("raw mode: ${e}"),
+    }
 }
