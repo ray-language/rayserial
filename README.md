@@ -170,7 +170,7 @@ USB-serie real a 115200 baudios mueve 0,0115 MB/s: cualquiera de las dos sobra.
   que sí se probó es XON/XOFF (lo hace la disciplina de línea, también en un pty).
 - Las velocidades no estándar en macOS van por `IOSSIOSPEED`, que **sí se puede expresar**
   con el FFI de raylang… pero no con `ioctl`, que es variádica: rayserial llama a `__ioctl`, el
-  envoltorio no variádico de Darwin (ver hallazgo 3).
+  envoltorio no variádico de Darwin (ver hallazgo 3, #393).
 - **Linux**: las constantes, el `struct termios` de glibc, los códigos `B*` y la `dirent` están,
   pero **sin probar** (no hay Linux a mano). Velocidades sin código `B*` (250000, 74880) dan
   error en Linux: harían falta `termios2`/`BOTHER` (`TCSETS2`), no implementados.
@@ -181,7 +181,9 @@ USB-serie real a 115200 baudios mueve 0,0115 MB/s: cualquiera de las dos sobra.
 
 ## Hallazgos de dogfood
 
-Con su reproducción mínima en raylang 1.27.95 release; los rodeos están marcados en el código.
+Registrados en `ray-apps/findings/` (campaña `rayserial-1.27.95`), con su reproducción mínima en
+raylang 1.27.95; los rodeos están marcados en el código. El 1 amplía el #372 (rayfocus); del 2 al 6
+son #392–#396, en este mismo orden.
 
 1. **[B] `ray fmt` borra en silencio la llamada a método que sigue a un literal interpolado**
    en ciertas posiciones: `let s = "id-${n}".to_upper() + "!";` queda `let s = "id-${n}";`,
@@ -213,8 +215,8 @@ Con su reproducción mínima en raylang 1.27.95 release; los rodeos están marca
 
 Positivo: el FFI de raylang aguanta una app de sistema entera — 22 funciones de libc, buffers
 de salida (`ffi.buffer`) que C rellena (también a través de un `extern blocking` que corre en
-otro hilo), `Option<string>`/`Option<ptr>` de vuelta, `errno` fiable en VM y nativo — y **ninguna
-prueba se comportó distinto en VM y en nativo**.
+otro hilo), `Option<string>`/`Option<ptr>` de vuelta, `errno` fiable en VM y nativo — y **las 28 pruebas
+y las 46 E2E pasan igual en VM y en nativo** (la única divergencia es la de las señales, hallazgo 2).
 
 ## Licencia
 
