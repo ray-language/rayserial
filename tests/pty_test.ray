@@ -249,3 +249,30 @@ fn expect_script_against_a_fiber_board() {
     port.close_port(p);
     sys.close_fd(m);
 }
+
+@test
+fn xonxoff_from_the_board_pauses_our_output() {
+    let pair = pty.open_pair().unwrap();
+    let p = port.open_port(pair.slave_path, cfg(115200, 8, "none", 1, "xonxoff")).unwrap();
+    // the board says XOFF: the line discipline holds what we write
+    sys.write_all(pair.master, b"\x13", 500).unwrap();
+    time.sleep(30);
+    sys.write_all(p.fd, b"hello", 500).unwrap();
+    assert_eq(sys.poll_fds([pair.master], [sys.POLLIN], 200).unwrap().len(), 0);
+    // XON: it flows, and neither control octet reached our reader
+    sys.write_all(pair.master, b"\x11", 500).unwrap();
+    assert_eq(read_exact(pair.master, 5), b"hello");
+    assert_eq(sys.poll_fds([p.fd], [sys.POLLIN], 100).unwrap().len(), 0);
+    port.close_port(p);
+    sys.close_fd(pair.master);
+}
+
+@test
+fn without_flow_control_xoff_is_just_data() {
+    let pair = pty.open_pair().unwrap();
+    let p = port.open_port(pair.slave_path, termios.default_config()).unwrap();
+    sys.write_all(pair.master, b"\x13\x11", 500).unwrap();
+    assert_eq(read_exact(p.fd, 2), b"\x13\x11");
+    port.close_port(p);
+    sys.close_fd(pair.master);
+}
