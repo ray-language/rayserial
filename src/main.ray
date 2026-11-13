@@ -1,0 +1,308 @@
+//! rayserial — a serial terminal for Arduino/ESP32-style boards, over libc
+//! through raylang's FFI.
+
+import board;
+import port;
+import ports;
+import runner;
+import script;
+import session;
+import termios;
+import transfer;
+import std/fs;
+import std/io;
+from termios import LineConfig;
+
+const VERSION: string = "0.1.0";
+
+const USAGE: string = `rayserial — serial terminal for Arduino/ESP32-style boards
+
+usage:
+  rayserial list [--all]
+  rayserial open PORT [LINE] [--echo] [--crlf] [--hex] [--quiet] [--for SECS]
+  rayserial send PORT FILE|- [LINE] [--chunk N] [--delay MS] [--rx FILE|-] [--rx-idle MS]
+  rayserial capture PORT -o FILE|- [LINE] [--for SECS] [--bytes N] [--idle MS]
+                    [--timestamps] [--send TEXT]
+  rayserial expect PORT SCRIPT [LINE] [--timeout SECS] [--quiet]
+  rayserial fake-board [--mode sketch|echo|sink|source] [--for SECS] [--sensor-ms N]
+                    [--rate BYTES_PER_S] [--bytes N] [--exit-idle MS] [--link PATH]
+
+LINE (serial line options):
+  -b, --baud N        speed (default 115200; non-standard rates use IOSSIOSPEED on macOS)
+  --data 5|6|7|8      data bits (default 8)
+  --parity none|even|odd
+  --stop 1|2
+  --flow none|rtscts|xonxoff
+
+In 'open', Ctrl-A is the escape key: Ctrl-A x quits, Ctrl-A ? lists the others.
+`;
+
+/// The command line, split into positionals and --options.
+struct Args {
+    positional: [string],
+    options: Map<string, string>,
+    flags: [string],
+}
+
+const FLAGS: [string] = ["--echo", "--crlf", "--hex", "--quiet", "--timestamps", "--all", "-q"];
+
+fn parse_args(argv: [string]) -> Result<Args, string> {
+    var pos: [string] = [];
+    let opts: Map<string, string> = Map.new();
+    var flags: [string] = [];
+    var i = 0;
+    while (i < argv.len()) {
+        let a = argv[i];
+        if (FLAGS.contains(a)) {
+            flags.push(a);
+        } else if (a.starts_with("-") && a != "-") {
+            if (i + 1 >= argv.len()) {
+                return Result.Err("option ${a} needs a value");
+            }
+            let key = if (a == "-b") { "--baud" } else if (a == "-o") { "--out" } else { a };
+            opts.insert(key, argv[i + 1]);
+            i = i + 1;
+        } else {
+            pos.push(a);
+        }
+        i = i + 1;
+    }
+    Result.Ok(Args { positional: pos, options: opts, flags: flags })
+}
+
+fn opt_int(a: Args, key: string, default: int) -> Result<int, string> {
+    match (a.options.get(key)) {
+        Option.Some(v) => parse_int(v).ok_or("${key} expects a number, not '${v}'"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+/// Seconds (may be fractional) as ms.
+fn opt_secs(a: Args, key: string) -> Result<int, string> {
+    match (a.options.get(key)) {
+        Option.Some(v) => match (parse_float(v)) {
+            Option.Some(f) => Result.Ok((f * 1000.0) as int),
+            Option.None => Result.Err("${key} expects seconds, not '${v}'"),
+        },
+        Option.None => Result.Ok(0),
+    }
+}
+
+fn opt_str(a: Args, key: string, default: string) -> string {
+    a.options.get_or(key, default)
+}
+
+fn has(a: Args, flag: string) -> bool {
+    a.flags.contains(flag)
+}
+
+const KNOWN: [string] = [
+    "--baud",
+    "--data",
+    "--parity",
+    "--stop",
+    "--flow",
+    "--for",
+    "--chunk",
+    "--delay",
+    "--rx",
+    "--rx-idle",
+    "--out",
+    "--bytes",
+    "--idle",
+    "--send",
+    "--timeout",
+    "--mode",
+    "--sensor-ms",
+    "--rate",
+    "--exit-idle",
+    "--link"
+];
+
+fn line_config(a: Args) -> Result<LineConfig, string> {
+    for k in a.options.keys() {
+        if (!KNOWN.contains(k)) {
+            return Result.Err("unknown option ${k}");
+        }
+    }
+    let d = termios.default_config();
+    termios.validate(
+        LineConfig {
+            baud: opt_int(a, "--baud", d.baud)?,
+            data: opt_int(a, "--data", d.data)?,
+            parity: opt_str(a, "--parity", d.parity),
+            stop: opt_int(a, "--stop", d.stop)?,
+            flow: opt_str(a, "--flow", d.flow)
+        }
+    )
+}
+
+fn need(a: Args, n: int, what: string) -> Result<int, string> {
+    if (a.positional.len() < n) {
+        return Result.Err("missing ${what}\n\n${USAGE}");
+    }
+    Result.Ok(0)
+}
+
+fn cmd_list(a: Args) -> Result<int, string> {
+    let found = ports.list_ports("/dev")?;
+    var shown = 0;
+    for p in found {
+        let name = p.substring(5, p.len());
+        let kind = ports.kind_of(name);
+        if (!has(a, "--all") && (kind == "bluetooth" || kind == "system")) {
+            continue;
+        }
+        print("${p}\t${kind}");
+        shown = shown + 1;
+    }
+    if (shown == 0) {
+        eprint(
+            "no serial ports found (${found.len()} hidden as bluetooth/system: --all shows them)"
+        );
+    }
+    Result.Ok(0)
+}
+
+fn cmd_open(a: Args) -> Result<int, string> {
+    need(a, 2, "PORT")?;
+    let c = line_config(a)?;
+    let p = port.open_port(a.positional[1], c)?;
+    let o = session.SessionOptions {
+        echo: has(a, "--echo"),
+        crlf: has(a, "--crlf"),
+        hex: has(a, "--hex"),
+        quiet: has(a, "--quiet") || has(a, "-q"),
+        for_ms: opt_secs(a, "--for")?
+    };
+    let r = session.run(p, o);
+    port.close_port(p);
+    r?;
+    Result.Ok(0)
+}
+
+fn cmd_send(a: Args) -> Result<int, string> {
+    need(a, 3, "PORT and FILE")?;
+    let c = line_config(a)?;
+    let file = a.positional[2];
+    let src = if (file == "-") {
+        transfer.Source.Stdin
+    } else {
+        transfer.Source.File(fs.read_file_bytes(file)?)
+    };
+    let p = port.open_port(a.positional[1], c)?;
+    let o = transfer.SendOptions {
+        chunk: opt_int(a, "--chunk", 4096)?,
+        delay_ms: opt_int(a, "--delay", 0)?,
+        rx: opt_str(a, "--rx", ""),
+        rx_idle_ms: opt_int(a, "--rx-idle", 0)?
+    };
+    let r = transfer.send(p, src, o);
+    port.close_port(p);
+    let s = r?;
+    eprint("sent ${transfer.rate_line(s.sent, s.elapsed_ms)}; received ${s.received} bytes");
+    Result.Ok(0)
+}
+
+fn cmd_capture(a: Args) -> Result<int, string> {
+    need(a, 2, "PORT")?;
+    let c = line_config(a)?;
+    let out = opt_str(a, "--out", "");
+    if (out == "") {
+        return Result.Err("capture needs -o FILE (or -o - for stdout)");
+    }
+    let send_first = match (a.options.get("--send")) {
+        Option.Some(t) => script.unescape(t)?,
+        Option.None => b"",
+    };
+    let p = port.open_port(a.positional[1], c)?;
+    let o = transfer.CaptureOptions {
+        out: out,
+        for_ms: opt_secs(a, "--for")?,
+        max_bytes: opt_int(a, "--bytes", 0)?,
+        idle_ms: opt_int(a, "--idle", 0)?,
+        stamps: has(a, "--timestamps"),
+        send_first: send_first
+    };
+    let r = transfer.capture(p, o);
+    port.close_port(p);
+    let s = r?;
+    eprint("captured ${transfer.rate_line(s.received, s.elapsed_ms)}");
+    Result.Ok(0)
+}
+
+fn cmd_expect(a: Args) -> Result<int, string> {
+    need(a, 3, "PORT and SCRIPT")?;
+    let c = line_config(a)?;
+    let text = fs.read_file(a.positional[2])?;
+    let lines = script.parse(text)?;
+    let timeout = opt_secs(a, "--timeout")?;
+    let p = port.open_port(a.positional[1], c)?;
+    let quiet = has(a, "--quiet") || has(a, "-q");
+    let r = runner.run(p, lines, !quiet, if (timeout > 0) { timeout } else { 5000 });
+    port.close_port(p);
+    let n = r?;
+    eprint("\nexpect: script ok (${n} expectation(s) met)");
+    Result.Ok(0)
+}
+
+fn cmd_board(a: Args) -> Result<int, string> {
+    for k in a.options.keys() {
+        if (!KNOWN.contains(k)) {
+            return Result.Err("unknown option ${k}");
+        }
+    }
+    let mode = opt_str(a, "--mode", "sketch");
+    if (!["sketch", "echo", "sink", "source"].contains(mode)) {
+        return Result.Err("unknown mode ${mode}");
+    }
+    let o = board.BoardOptions {
+        mode: mode,
+        for_ms: opt_secs(a, "--for")?,
+        sensor_ms: opt_int(a, "--sensor-ms", 1000)?,
+        rate: opt_int(a, "--rate", 0)?,
+        total: opt_int(a, "--bytes", 1048576)?,
+        exit_idle_ms: opt_int(a, "--exit-idle", 0)?,
+        link: opt_str(a, "--link", "")
+    };
+    board.run(o)?;
+    Result.Ok(0)
+}
+
+fn main() -> int {
+    let a = match (parse_args(args())) {
+        Result.Ok(a) => a,
+        Result.Err(e) => {
+            eprint("rayserial: ${e}");
+            return 2;
+        },
+    };
+    if (a.positional.len() == 0) {
+        let _ = io.write(USAGE);
+        return 2;
+    }
+    let r = match (a.positional[0]) {
+        "list" => cmd_list(a),
+        "open" => cmd_open(a),
+        "send" => cmd_send(a),
+        "capture" => cmd_capture(a),
+        "expect" => cmd_expect(a),
+        "fake-board" => cmd_board(a),
+        "version" => {
+            print("rayserial ${VERSION}");
+            Result.Ok(0)
+        },
+        "help" => {
+            let _ = io.write(USAGE);
+            Result.Ok(0)
+        },
+        other => Result.Err("unknown command '${other}'\n\n${USAGE}"),
+    };
+    match (r) {
+        Result.Ok(code) => code,
+        Result.Err(e) => {
+            eprint("rayserial: ${e}");
+            1
+        },
+    }
+}

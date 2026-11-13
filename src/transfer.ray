@@ -1,0 +1,315 @@
+//! `rayserial send` and `rayserial capture`: moving files over the port.
+//! Both are poll loops over the non-blocking port fd; both read whatever
+//! the board sends while they run (a board whose output nobody reads blocks,
+//! and then stops reading too).
+
+import port;
+import sys;
+import view;
+import std/fs;
+import std/io;
+import std/time;
+from port import Port;
+
+pub struct Stats {
+    sent: int,
+    received: int,
+    elapsed_ms: int,
+}
+
+/// "1048576 bytes in 812 ms (1291.3 KB/s)"
+pub fn rate_line(n: int, ms: int) -> string {
+    let kbs = if (ms <= 0) { 0 } else { (n * 10000 / 1024) / ms };
+    "${n} bytes in ${ms} ms (${kbs / 10}.${kbs % 10} KB/s)"
+}
+
+/// Where received octets go: a file handle, stdout, or nowhere.
+pub struct Sink {
+    handle: int,
+    to_stdout: bool,
+    stamps: bool,
+    at_line_start: bool,
+}
+
+pub fn open_sink(path: string, stamps: bool) -> Result<Sink, string> {
+    if (path == "") {
+        return Result.Ok(
+            Sink { handle: -1, to_stdout: false, stamps: stamps, at_line_start: true }
+        );
+    }
+    if (path == "-") {
+        return Result.Ok(Sink { handle: -1, to_stdout: true, stamps: stamps, at_line_start: true });
+    }
+    let h = fs.open(path, "w")?;
+    Result.Ok(Sink { handle: h, to_stdout: false, stamps: stamps, at_line_start: true })
+}
+
+/// Prefixes every line of `chunk` with `stamp`. `at_start` says whether the
+/// previous chunk ended a line. Returns the text and the new flag.
+pub fn stamp_lines(at_start: bool, chunk: bytes, stamp: string) -> (bytes, bool) {
+    var parts: [bytes] = [];
+    var start = at_start;
+    var from_i = 0;
+    let n = chunk.len();
+    for i in 0..n {
+        if (start) {
+            parts.push(stamp.to_bytes());
+            start = false;
+        }
+        if (chunk[i] == 0x0A) {
+            parts.push(chunk.sub_bytes(from_i, i + 1));
+            from_i = i + 1;
+            start = true;
+        }
+    }
+    if (from_i < n) {
+        parts.push(chunk.sub_bytes(from_i, n));
+    }
+    return (bytes_concat(parts), start);
+}
+
+pub fn sink_write(s: Sink, chunk: bytes) -> Result<int, string> {
+    var data = chunk;
+    if (s.stamps) {
+        let stamp = "[${time.to_iso8601_millis(time.now())}] ";
+        let (b, st) = stamp_lines(s.at_line_start, chunk, stamp);
+        data = b;
+        s.at_line_start = st;
+    }
+    if (s.to_stdout) {
+        io.write_bytes(data)?;
+        io.flush()?;
+    } else if (s.handle >= 0) {
+        fs.write_bytes(s.handle, data)?;
+    }
+    Result.Ok(data.len())
+}
+
+pub fn sink_close(s: Sink) {
+    if (s.handle >= 0) {
+        close(s.handle);
+    }
+}
+
+pub struct CaptureOptions {
+    out: string,
+    for_ms: int,
+    max_bytes: int,
+    idle_ms: int,
+    stamps: bool,
+    send_first: bytes,
+}
+
+/// Stops on: --for elapsed, --bytes reached, --idle after the first octet,
+/// SIGINT/SIGTERM, or the port closing.
+pub fn capture(p: Port, o: CaptureOptions) -> Result<Stats, string> {
+    let sink = open_sink(o.out, o.stamps)?;
+    let sig = signals();
+    let start = time.monotonic_millis();
+    if (o.send_first.len() > 0) {
+        sys.write_all(p.fd, o.send_first, 5000)?;
+    }
+    var got = 0;
+    var last_data = start;
+    var result: Result<Stats, string> = Result.Ok(Stats { sent: 0, received: 0, elapsed_ms: 0 });
+    while (true) {
+        let now = time.monotonic_millis();
+        if (o.for_ms > 0 && now - start >= o.for_ms) {
+            break;
+        }
+        if (o.idle_ms > 0 && got > 0 && now - last_data >= o.idle_ms) {
+            break;
+        }
+        if (o.max_bytes > 0 && got >= o.max_bytes) {
+            break;
+        }
+        match (try_recv(sig)) {
+            Received.Got(s) => if (s == 2 || s == 15) {
+                break;
+            },
+            _ => { },
+        }
+        let ready = match (sys.poll_fds([p.fd], [sys.POLLIN], 100)) {
+            Result.Ok(r) => r,
+            Result.Err(e) => {
+                result = Result.Err(e);
+                break;
+            },
+        };
+        if (ready.len() == 0) {
+            continue;
+        }
+        let want = if (o.max_bytes > 0) { min_int(65536, o.max_bytes - got) } else { 65536 };
+        match (sys.read_chunk(p.fd, want)) {
+            sys.Chunk.Data(b) => {
+                got = got + b.len();
+                last_data = time.monotonic_millis();
+                match (sink_write(sink, b)) {
+                    Result.Ok(_) => { },
+                    Result.Err(e) => {
+                        result = Result.Err(e);
+                        break;
+                    },
+                }
+            },
+            sys.Chunk.Again => { },
+            sys.Chunk.Eof => break,
+            sys.Chunk.Failed(code, msg) => {
+                if (code != sys.EIO) {
+                    result = Result.Err(msg);
+                }
+                break;
+            },
+        }
+    }
+    sink_close(sink);
+    let elapsed = time.monotonic_millis() - start;
+    match (result) {
+        Result.Ok(_) => Result.Ok(Stats { sent: o.send_first.len(), received: got, elapsed_ms: elapsed }),
+        Result.Err(e) => Result.Err(e),
+    }
+}
+
+pub fn min_int(a: int, b: int) -> int {
+    if (a < b) { a } else { b }
+}
+
+pub struct SendOptions {
+    chunk: int,
+    delay_ms: int,
+    rx: string,
+    rx_idle_ms: int,
+}
+
+/// The data source of `send`: a whole file, or stdin read as it comes.
+pub enum Source {
+    File(bytes),
+    Stdin,
+}
+
+/// Sends the data, `chunk` octets at a time (`delay_ms` apart when > 0),
+/// while reading what comes back into `rx` (a file, "-" or "" = discard).
+/// After the last octet: tcdrain, then keep reading until `rx_idle_ms` of
+/// silence (0 = do not wait).
+pub fn send(p: Port, src: Source, o: SendOptions) -> Result<Stats, string> {
+    let sink = open_sink(o.rx, false)?;
+    let start = time.monotonic_millis();
+    let chunk = if (o.chunk <= 0) { 4096 } else { o.chunk };
+    var data = match (src) {
+        Source.File(b) => b,
+        Source.Stdin => b"",
+    };
+    let streaming = match (src) {
+        Source.Stdin => true,
+        Source.File(_) => false,
+    };
+    var stdin_done = !streaming;
+    var off = 0;
+    var sent = 0;
+    var got = 0;
+    var next_at = start;
+    var last_progress = start;
+    while (true) {
+        if (streaming && !stdin_done && off >= data.len()) {
+            match (io.read(65536)) {
+                Option.Some(b) => {
+                    data = b;
+                    off = 0;
+                },
+                Option.None => stdin_done = true,
+            }
+        }
+        let pending = off < data.len();
+        if (!pending && stdin_done) {
+            break;
+        }
+        let now = time.monotonic_millis();
+        let may_write = pending && now >= next_at;
+        let events = if (may_write) { sys.POLLIN | sys.POLLOUT } else { sys.POLLIN };
+        let wait = if (pending && !may_write) { min_int(100, next_at - now) } else { 100 };
+        let ready = sys.poll_fds([p.fd], [events], wait)?;
+        if (ready.len() == 0) {
+            if (may_write && time.monotonic_millis() - last_progress > 10000) {
+                sink_close(sink);
+                return Result.Err("send: the port accepted nothing for 10 s (flow control held?)");
+            }
+            continue;
+        }
+        let rev = ready[0];
+        if ((rev & sys.POLLIN) != 0) {
+            let n = drain_into(p, sink)?;
+            if (n < 0) {
+                sink_close(sink);
+                return Result.Err("send: the port closed after ${sent} bytes");
+            }
+            got = got + n;
+        }
+        if (may_write && (rev & sys.POLLOUT) != 0) {
+            let end = min_int(off + chunk, data.len());
+            let piece = data.sub_bytes(off, end);
+            let n = sys.write(p.fd, piece, piece.len() as u64);
+            if (n > 0) {
+                off = off + n;
+                sent = sent + n;
+                last_progress = time.monotonic_millis();
+                if (o.delay_ms > 0) {
+                    next_at = last_progress + o.delay_ms;
+                }
+            } else if (n < 0) {
+                let code = sys.errno_now();
+                if (code != sys.eagain() && code != sys.EINTR) {
+                    sink_close(sink);
+                    return Result.Err(sys.describe("write", code));
+                }
+            }
+        }
+        if ((rev & (sys.POLLHUP | sys.POLLERR | sys.POLLNVAL)) != 0 && (rev & sys.POLLIN) == 0) {
+            sink_close(sink);
+            return Result.Err("send: the port hung up after ${sent} bytes");
+        }
+    }
+    let _ = port.drain(p);
+    let sent_ms = time.monotonic_millis() - start;
+    if (o.rx_idle_ms > 0) {
+        var last = time.monotonic_millis();
+        while (time.monotonic_millis() - last < o.rx_idle_ms) {
+            let ready = sys.poll_fds([p.fd], [sys.POLLIN], 50)?;
+            if (ready.len() > 0 && (ready[0] & sys.POLLIN) != 0) {
+                let n = drain_into(p, sink)?;
+                if (n < 0) {
+                    break;
+                }
+                if (n > 0) {
+                    got = got + n;
+                    last = time.monotonic_millis();
+                }
+            } else if (ready.len() > 0) {
+                break;
+            }
+        }
+    }
+    sink_close(sink);
+    Result.Ok(Stats { sent: sent, received: got, elapsed_ms: sent_ms })
+}
+
+/// Reads what is waiting on the port into the sink. -1 = the port closed.
+fn drain_into(p: Port, sink: Sink) -> Result<int, string> {
+    match (sys.read_chunk(p.fd, 65536)) {
+        sys.Chunk.Data(b) => {
+            sink_write(sink, b)?;
+            Result.Ok(b.len())
+        },
+        sys.Chunk.Again => Result.Ok(0),
+        sys.Chunk.Eof => Result.Ok(-1),
+        sys.Chunk.Failed(code, msg) => if (code == sys.EIO) {
+            Result.Ok(-1)
+        } else {
+            Result.Err(msg)
+        },
+    }
+}
+
+/// A printable preview of what came back, for --verbose.
+pub fn preview(b: bytes) -> string {
+    view.escaped(b.sub_bytes(0, min_int(b.len(), 80)))
+}

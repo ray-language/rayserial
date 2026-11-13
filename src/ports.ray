@@ -1,0 +1,81 @@
+//! `rayserial list`: the serial devices under /dev, read with
+//! opendir/readdir through raw pointers (the dirent is copied out of C
+//! memory with memcpy into a raylang buffer).
+
+import sys;
+import std/ffi;
+
+/// Name prefixes of serial devices: macOS call-out/dial-in nodes and the
+/// Linux USB-serial (FTDI/CH340/CP210x) and CDC-ACM (Arduino, ESP32-S2/S3)
+/// nodes.
+const PREFIXES: [string] = ["cu.", "tty.usb", "ttyUSB", "ttyACM", "ttyAMA", "rfcomm"];
+
+pub fn is_serial_name(name: string) -> bool {
+    for p in PREFIXES {
+        if (name.starts_with(p)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// What a device name looks like: a USB serial adapter, Bluetooth, or a
+/// system node (macOS debug-console, wlan-debug).
+pub fn kind_of(name: string) -> string {
+    let n = name.to_lower();
+    if (n.contains("bluetooth") || n.starts_with("rfcomm") || n.contains("-audio")) {
+        return "bluetooth";
+    }
+    if (n.contains("debug")) {
+        return "system";
+    }
+    if (n.contains("usb") || n.starts_with("ttyacm") || n.contains("slab") || n.contains("wch")) {
+        return "usb";
+    }
+    "other"
+}
+
+/// Every entry name of `dir`, via readdir(3). dirent layout: macOS
+/// d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2) d_type(1) d_name@21;
+/// Linux d_ino(8) d_off(8) d_reclen(2) d_type(1) d_name@19 (NUL-ended).
+pub fn read_dir(dir: string) -> Result<[string], string> {
+    let linux = sys.is_linux();
+    let d = match (sys.opendir(dir)) {
+        Option.Some(h) => h,
+        Option.None => return Result.Err(sys.last_error("opendir ${dir}")),
+    };
+    var names: [string] = [];
+    while (true) {
+        let e = match (sys.readdir(d)) {
+            Option.Some(e) => e,
+            Option.None => break,
+        };
+        let head = ffi.buffer(24);
+        sys.memcpy(head, e, 24 as u64);
+        let reclen = sys.read_le(head, 16, 2);
+        let name_off = if (linux) { 19 } else { 21 };
+        let rec = ffi.buffer(reclen);
+        sys.memcpy(rec, e, reclen as u64);
+        let len = if (linux) {
+            var n = 0;
+            while (name_off + n < reclen && rec[name_off + n] != 0) {
+                n = n + 1;
+            }
+            n
+        } else {
+            sys.read_le(head, 18, 2)
+        };
+        let name = from_utf8(rec.sub_bytes(name_off, name_off + len)).unwrap_or("");
+        if (name != "" && name != "." && name != "..") {
+            names.push(name);
+        }
+    }
+    sys.closedir(d);
+    Result.Ok(sort(names))
+}
+
+/// The serial devices of `dir` (normally /dev), full paths, sorted.
+pub fn list_ports(dir: string) -> Result<[string], string> {
+    let names = read_dir(dir)?;
+    Result.Ok(names.filter(is_serial_name).map(fn(n: string) -> string { "${dir}/${n}" }))
+}

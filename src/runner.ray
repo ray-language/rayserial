@@ -1,0 +1,152 @@
+//! Runs an expect script (src/script.ray) against an open port.
+
+import port;
+import script;
+import sys;
+import view;
+import std/io;
+import std/regex;
+import std/time;
+from port import Port;
+from script import Line, Step;
+
+/// What has been received and not yet consumed by an expect.
+pub struct Rx {
+    buf: bytes,
+    echo: bool,
+    total: int,
+}
+
+const KEEP: int = 65536;
+
+/// Reads from the port until `deadline` (monotonic ms) or until `done`
+/// says the buffer holds what we wait for. Returns false on timeout.
+fn pump_until(p: Port, rx: Rx, deadline: int, done: fn(bytes) -> bool) -> Result<bool, string> {
+    while (true) {
+        if (done(rx.buf)) {
+            return Result.Ok(true);
+        }
+        let left = deadline - time.monotonic_millis();
+        if (left <= 0) {
+            return Result.Ok(false);
+        }
+        let ready = sys.poll_fds([p.fd], [sys.POLLIN], if (left < 100) { left } else { 100 })?;
+        if (ready.len() == 0) {
+            continue;
+        }
+        match (sys.read_chunk(p.fd, 4096)) {
+            sys.Chunk.Data(b) => {
+                if (rx.echo) {
+                    io.write_bytes(b)?;
+                    io.flush()?;
+                }
+                rx.total = rx.total + b.len();
+                let joined = rx.buf + b;
+                rx.buf = if (joined.len() > KEEP) {
+                    joined.sub_bytes(joined.len() - KEEP, joined.len())
+                } else {
+                    joined
+                };
+            },
+            sys.Chunk.Again => { },
+            sys.Chunk.Eof => return Result.Err("the port closed"),
+            sys.Chunk.Failed(_, msg) => return Result.Err(msg),
+        }
+    }
+}
+
+fn tail(b: bytes) -> string {
+    let n = b.len();
+    view.escaped(if (n > 120) { b.sub_bytes(n - 120, n) } else { b })
+}
+
+/// Runs every step; the first failed expect (or I/O error) is the Err,
+/// prefixed with its line number.
+pub fn run(p: Port, lines: [Line], echo: bool, default_timeout_ms: int) -> Result<int, string> {
+    let rx = Rx { buf: b"", echo: echo, total: 0 };
+    var timeout = default_timeout_ms;
+    var matched = 0;
+    for l in lines {
+        let r = step(p, rx, l.step, timeout);
+        match (r) {
+            Result.Ok(t) => {
+                if (t >= 0) {
+                    timeout = t;
+                }
+                if (t == -2) {
+                    matched = matched + 1;
+                }
+            },
+            Result.Err(e) => return Result.Err("line ${l.no}: ${e}"),
+        }
+    }
+    Result.Ok(matched)
+}
+
+/// One step. Ok(n >= 0) = a new timeout; Ok(-2) = an expect matched;
+/// Ok(-1) = nothing to report.
+fn step(p: Port, rx: Rx, s: Step, timeout: int) -> Result<int, string> {
+    match (s) {
+        Step.Send(b) => {
+            sys.write_all(p.fd, b, 5000)?;
+            Result.Ok(-1)
+        },
+        Step.Expect(needle) => {
+            let deadline = time.monotonic_millis() + timeout;
+            let found = pump_until(
+                p,
+                rx,
+                deadline,
+                fn(buf: bytes) -> bool { buf.index_of(needle).is_some() }
+            )?;
+            if (!found) {
+                return Result.Err(
+                    "timeout (${timeout} ms) waiting for \"${view.escaped(needle)}\"; last received: \"${tail(rx.buf)}\""
+                );
+            }
+            let at = rx.buf.index_of(needle).unwrap();
+            rx.buf = rx.buf.sub_bytes(at + needle.len(), rx.buf.len());
+            Result.Ok(-2)
+        },
+        Step.ExpectRe(pat) => {
+            let re = regex.compile(pat)
+                .map_err(fn(e: string) -> string { "bad regex /${pat}/: ${e}" })?;
+            let deadline = time.monotonic_millis() + timeout;
+            let found = pump_until(
+                p,
+                rx,
+                deadline,
+                fn(buf: bytes) -> bool { re.find(view.latin1(buf)).is_some() }
+            )?;
+            if (!found) {
+                return Result.Err(
+                    "timeout (${timeout} ms) waiting for /${pat}/; last received: \"${tail(rx.buf)}\""
+                );
+            }
+            let (_, end) = re.find(view.latin1(rx.buf)).unwrap();
+            rx.buf = rx.buf.sub_bytes(end, rx.buf.len());
+            Result.Ok(-2)
+        },
+        Step.Sleep(ms) => {
+            pump_until(p, rx, time.monotonic_millis() + ms, fn(buf: bytes) -> bool { false })?;
+            Result.Ok(-1)
+        },
+        Step.Timeout(ms) => Result.Ok(ms),
+        Step.Reset(ms) => {
+            port.pulse_dtr(p, ms)?;
+            Result.Ok(-1)
+        },
+        Step.Baud(n) => {
+            port.set_baud(p, n)?;
+            Result.Ok(-1)
+        },
+        Step.Flush => {
+            rx.buf = b"";
+            Result.Ok(-1)
+        },
+        Step.Log(text) => {
+            eprint("[expect] ${text}");
+            Result.Ok(-1)
+        },
+    }
+}

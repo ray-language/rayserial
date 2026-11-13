@@ -1,0 +1,177 @@
+//! The `rayserial expect` script language: one command per line.
+//!
+//!     # comment
+//!     timeout 5s            default wait for the following expects
+//!     reset [100ms]         pulse DTR (Arduino auto-reset)
+//!     expect "ready"        wait until the received text contains it
+//!     expect /t=\d+/        ... or matches a regex
+//!     send "led on\r\n"     send octets (escapes \r \n \t \0 \\ \" \xNN)
+//!     sendline led on       send the rest of the line plus CR LF
+//!     sleep 250ms           wait (ms, s, or a bare number of ms)
+//!     baud 9600             change the port speed
+//!     flush                 forget what was received so far
+//!     log some text         print a note on stderr
+//!
+//! Text after the command may be quoted (escapes apply) or bare (taken as
+//! is, trimmed).
+
+pub enum Step {
+    Send(bytes),
+    Expect(bytes),
+    ExpectRe(string),
+    Sleep(int),
+    Timeout(int),
+    Reset(int),
+    Baud(int),
+    Flush,
+    Log(string),
+}
+
+pub struct Line {
+    no: int,
+    step: Step,
+}
+
+/// Parses a duration: "250ms", "2s", "1.5s", "300" (ms).
+pub fn parse_duration(s: string) -> Result<int, string> {
+    let t = s.trim();
+    if (t.ends_with("ms")) {
+        return parse_int(t.substring(0, t.len() - 2)).ok_or("bad duration: ${s}");
+    }
+    if (t.ends_with("s")) {
+        let n = t.substring(0, t.len() - 1);
+        return match (parse_float(n)) {
+            Option.Some(f) => Result.Ok((f * 1000.0) as int),
+            Option.None => Result.Err("bad duration: ${s}"),
+        };
+    }
+    parse_int(t).ok_or("bad duration: ${s}")
+}
+
+fn hex_val(c: char) -> int {
+    let n = char_code(c);
+    if (n >= 48 && n <= 57) {
+        return n - 48;
+    }
+    if (n >= 97 && n <= 102) {
+        return n - 87;
+    }
+    if (n >= 65 && n <= 70) {
+        return n - 55;
+    }
+    -1
+}
+
+/// The octets of a quoted argument (without the quotes), escapes applied.
+pub fn unescape(s: string) -> Result<bytes, string> {
+    var out: [int] = [];
+    let cs = s.chars();
+    var i = 0;
+    while (i < cs.len()) {
+        let c = cs[i];
+        if (c != '\\') {
+            // (a named string: `ray fmt` 1.27.95 drops a method call written
+            // straight after an interpolated literal here)
+            let one = "${c}";
+            for b in one.to_bytes() {
+                out.push(b);
+            }
+            i = i + 1;
+            continue;
+        }
+        if (i + 1 >= cs.len()) {
+            return Result.Err("dangling backslash");
+        }
+        let e = cs[i + 1];
+        i = i + 2;
+        match (e) {
+            'r' => out.push(0x0D),
+            'n' => out.push(0x0A),
+            't' => out.push(0x09),
+            '0' => out.push(0),
+            '\\' => out.push(0x5C),
+            '"' => out.push(0x22),
+            'x' => {
+                if (i + 1 >= cs.len()) {
+                    return Result.Err("short \\x escape");
+                }
+                let hi = hex_val(cs[i]);
+                let lo = hex_val(cs[i + 1]);
+                if (hi < 0 || lo < 0) {
+                    return Result.Err("bad \\x escape");
+                }
+                out.push(hi * 16 + lo);
+                i = i + 2;
+            },
+            _ => return Result.Err("unknown escape \\${e}"),
+        }
+    }
+    Result.Ok(bytes_of(out))
+}
+
+/// The argument of a command: "quoted" (escapes) or bare (as written).
+fn argument(rest: string) -> Result<bytes, string> {
+    let r = rest.trim();
+    if (r.len() >= 2 && r.starts_with("\"") && r.ends_with("\"")) {
+        return unescape(r.substring(1, r.len() - 1));
+    }
+    if (r.starts_with("\"")) {
+        return Result.Err("unterminated string");
+    }
+    Result.Ok(r.to_bytes())
+}
+
+fn parse_line(cmd: string, rest: string) -> Result<Option<Step>, string> {
+    let r = rest.trim();
+    match (cmd) {
+        "send" => Result.Ok(Option.Some(Step.Send(argument(r)?))),
+        "sendline" => Result.Ok(Option.Some(Step.Send(argument(r)? + b"\r\n"))),
+        "expect" => {
+            if (r.len() >= 2 && r.starts_with("/") && r.ends_with("/")) {
+                return Result.Ok(Option.Some(Step.ExpectRe(r.substring(1, r.len() - 1))));
+            }
+            let needle = argument(r)?;
+            if (needle.len() == 0) {
+                return Result.Err("expect needs a text");
+            }
+            Result.Ok(Option.Some(Step.Expect(needle)))
+        },
+        "sleep" => Result.Ok(Option.Some(Step.Sleep(parse_duration(r)?))),
+        "timeout" => Result.Ok(Option.Some(Step.Timeout(parse_duration(r)?))),
+        "reset" => {
+            let ms = if (r == "") { 100 } else { parse_duration(r)? };
+            Result.Ok(Option.Some(Step.Reset(ms)))
+        },
+        "baud" => match (parse_int(r)) {
+            Option.Some(n) => Result.Ok(Option.Some(Step.Baud(n))),
+            Option.None => Result.Err("bad baud rate: ${r}"),
+        },
+        "flush" => Result.Ok(Option.Some(Step.Flush)),
+        "log" => Result.Ok(Option.Some(Step.Log(r))),
+        _ => Result.Err("unknown command '${cmd}'"),
+    }
+}
+
+/// The steps of a script, each with its line number. The first bad line
+/// is the error ("line N: ...").
+pub fn parse(text: string) -> Result<[Line], string> {
+    var out: [Line] = [];
+    var no = 0;
+    for raw in text.split("\n") {
+        no = no + 1;
+        let l = raw.trim();
+        if (l == "" || l.starts_with("#")) {
+            continue;
+        }
+        let (cmd, rest) = match (l.index_of(" ")) {
+            Option.Some(i) => (l.substring(0, i), l.substring(i + 1, l.len())),
+            Option.None => (l, ""),
+        };
+        match (parse_line(cmd, rest)) {
+            Result.Ok(Option.Some(s)) => out.push(Line { no: no, step: s }),
+            Result.Ok(Option.None) => { },
+            Result.Err(e) => return Result.Err("line ${no}: ${e}"),
+        }
+    }
+    Result.Ok(out)
+}

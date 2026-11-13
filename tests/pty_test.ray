@@ -1,0 +1,251 @@
+// The real libc path, in process: a pty pair stands in for the board.
+// The slave is opened and configured exactly like a USB serial port; the
+// master side checks what reached the "wire" and what the termios says.
+
+import board;
+import port;
+import ports;
+import pty;
+import runner;
+import script;
+import sys;
+import termios;
+import std/crypto;
+import std/fs;
+import std/time;
+from termios import LineConfig;
+
+fn cfg(baud: int, data: int, parity: string, stop: int, flow: string) -> LineConfig {
+    LineConfig { baud: baud, data: data, parity: parity, stop: stop, flow: flow }
+}
+
+/// Reads exactly `n` octets from `fd` (poll + read), or fails after 5 s.
+fn read_exact(fd: int, n: int) -> bytes {
+    var parts: [bytes] = [];
+    var got = 0;
+    let deadline = time.monotonic_millis() + 5000;
+    while (got < n) {
+        assert(time.monotonic_millis() < deadline);
+        let ready = sys.poll_fds([fd], [sys.POLLIN], 100).unwrap();
+        if (ready.len() == 0) {
+            continue;
+        }
+        match (sys.read_chunk(fd, n - got)) {
+            sys.Chunk.Data(b) => {
+                parts.push(b);
+                got = got + b.len();
+            },
+            sys.Chunk.Again => { },
+            sys.Chunk.Eof => panic("eof"),
+            sys.Chunk.Failed(_, m) => panic(m),
+        }
+    }
+    bytes_concat(parts)
+}
+
+fn all_octets(times: int) -> bytes {
+    var v: [int] = [];
+    for _ in 0..times {
+        for i in 0..256 {
+            v.push(i);
+        }
+    }
+    bytes_of(v)
+}
+
+@test
+fn configuration_reaches_the_line() {
+    let pair = pty.open_pair().unwrap();
+    let cases = [
+        cfg(115200, 8, "none", 1, "none"),
+        cfg(9600, 7, "even", 1, "none"),
+        cfg(57600, 8, "odd", 2, "rtscts"),
+        cfg(19200, 5, "none", 1, "xonxoff")
+    ];
+    for c in cases {
+        let p = port.open_port(pair.slave_path, c).unwrap();
+        assert_eq(p.speed_note, "termios");
+        // the master shares the slave's termios: what a peer would see
+        assert_eq(pty.peer_config(pair.master).unwrap(), c);
+        let snap = termios.get(pair.master).unwrap();
+        let f = termios.flags();
+        assert_eq(snap.t.lflag & (f.icanon | f.echo | f.isig | f.iexten), 0);
+        assert_eq(snap.t.oflag & f.opost, 0);
+        assert_eq(snap.t.cc[f.vmin], 1);
+        port.close_port(p);
+    }
+    sys.close_fd(pair.master);
+}
+
+@test
+fn close_restores_the_original_settings() {
+    let pair = pty.open_pair().unwrap();
+    let keep = pty.hold_slave(pair).unwrap();
+    let before = termios.get(pair.master).unwrap();
+    let p = port.open_port(pair.slave_path, cfg(9600, 7, "odd", 2, "none")).unwrap();
+    assert(termios.get(pair.master).unwrap().raw != before.raw);
+    port.close_port(p);
+    assert_eq(termios.get(pair.master).unwrap().raw, before.raw);
+    sys.close_fd(keep);
+    sys.close_fd(pair.master);
+}
+
+@test
+fn all_256_octets_both_ways() {
+    let pair = pty.open_pair().unwrap();
+    let p = port.open_port(pair.slave_path, termios.default_config()).unwrap();
+    let data = all_octets(4);
+    // A macOS pty queues about 1 KiB towards the slave: move it in 256s.
+    var got_a: [bytes] = [];
+    var got_b: [bytes] = [];
+    for i in 0..4 {
+        let piece = data.sub_bytes(i * 256, i * 256 + 256);
+        // board → rayserial
+        sys.write_all(pair.master, piece, 2000).unwrap();
+        got_a.push(read_exact(p.fd, 256));
+        // rayserial → board
+        sys.write_all(p.fd, piece, 2000).unwrap();
+        got_b.push(read_exact(pair.master, 256));
+    }
+    assert_eq(bytes_concat(got_a), data);
+    assert_eq(bytes_concat(got_b), data);
+    port.close_port(p);
+    sys.close_fd(pair.master);
+}
+
+@test
+fn one_mebibyte_in_chunks() {
+    let pair = pty.open_pair().unwrap();
+    let p = port.open_port(pair.slave_path, termios.default_config()).unwrap();
+    let block = board.pattern_block();
+    let h1 = crypto.sha256_init().unwrap();
+    let h2 = crypto.sha256_init().unwrap();
+    // 16 × 64 KiB, interleaving writes and reads (a pty holds a few KiB)
+    for _ in 0..16 {
+        var off = 0;
+        while (off < block.len()) {
+            let piece = block.sub_bytes(off, off + 512);
+            sys.write_all(pair.master, piece, 2000).unwrap();
+            crypto.hash_update(h1, piece).unwrap();
+            crypto.hash_update(h2, read_exact(p.fd, 512)).unwrap();
+            off = off + 512;
+        }
+    }
+    assert_eq(crypto.hash_final(h1).unwrap(), crypto.hash_final(h2).unwrap());
+    port.close_port(p);
+    sys.close_fd(pair.master);
+}
+
+@test
+fn nonstandard_baud_falls_back_on_a_pty() {
+    let pair = pty.open_pair().unwrap();
+    let p = port.open_port(pair.slave_path, cfg(250000, 8, "none", 1, "none")).unwrap();
+    if (sys.is_linux()) {
+        panic("not reached: Linux refuses 250000 without termios2");
+    }
+    // a pty has no IOSSIOSPEED: ENOTTY, then the rate goes in termios
+    assert(p.speed_note.starts_with("termios (IOSSIOSPEED: refused"));
+    assert(p.speed_note.contains("errno 25"));
+    assert_eq(pty.peer_config(pair.master).unwrap().baud, 250000);
+    port.set_baud(p, 74880).unwrap();
+    assert_eq(pty.peer_config(pair.master).unwrap().baud, 74880);
+    port.set_baud(p, 9600).unwrap();
+    assert_eq(p.speed_note, "termios");
+    port.close_port(p);
+    sys.close_fd(pair.master);
+}
+
+@test
+fn dtr_falls_back_to_b0_on_a_pty() {
+    let pair = pty.open_pair().unwrap();
+    let p = port.open_port(pair.slave_path, cfg(57600, 8, "none", 1, "none")).unwrap();
+    // ptys have no modem lines
+    let bits = port.modem_bits(p.fd);
+    assert(bits.is_err());
+    assert(port.set_rts(p, false).is_err());
+    let how = port.set_dtr(p, false).unwrap();
+    assert_eq(how, "B0 hangup");
+    assert_eq(pty.peer_config(pair.master).unwrap().baud, 0);
+    assert(!p.dtr);
+    port.set_dtr(p, true).unwrap();
+    assert_eq(pty.peer_config(pair.master).unwrap().baud, 57600);
+    port.close_port(p);
+    sys.close_fd(pair.master);
+}
+
+@test
+fn errors_carry_errno() {
+    let r = port.open_port("/dev/rayserial-does-not-exist", termios.default_config());
+    match (r) {
+        Result.Ok(_) => panic("opened a missing port"),
+        Result.Err(e) => assert(e.contains("errno 2")),
+    }
+    match (port.open_port("/dev/null", termios.default_config())) {
+        Result.Ok(_) => panic("/dev/null is not a tty"),
+        Result.Err(e) => assert(e.contains("not a terminal")),
+    }
+}
+
+@test
+fn readdir_through_pointers_matches_fs_list_dir() {
+    let dir = fs.make_temp_dir("rayserial").unwrap();
+    for n in [
+        "cu.usbmodem1101",
+        "cu.Bluetooth-Incoming-Port",
+        "ttyUSB0",
+        "notes.txt",
+        "a-much-longer-file-name-than-the-dirent-header-${"x".repeat(100)}"
+    ] {
+        fs.write_file("${dir}/${n}", "").unwrap();
+    }
+    let mine = ports.read_dir(dir).unwrap();
+    let theirs = sort(fs.list_dir(dir).unwrap());
+    assert_eq(mine, theirs);
+    assert_eq(
+        ports.list_ports(dir).unwrap(),
+        ["${dir}/cu.Bluetooth-Incoming-Port", "${dir}/cu.usbmodem1101", "${dir}/ttyUSB0"]
+    );
+    // and the real /dev
+    let dev = ports.read_dir("/dev").unwrap();
+    assert_eq(dev, sort(fs.list_dir("/dev").unwrap()));
+    fs.remove_all(dir).unwrap();
+}
+
+/// A minimal sketch on the master side, in its own fiber.
+fn serve_sketch(master: int, for_ms: int) {
+    let s = board.new_sketch();
+    let start = time.monotonic_millis();
+    while (time.monotonic_millis() - start < for_ms) {
+        let ready = sys.poll_fds([master], [sys.POLLIN], 10).unwrap();
+        if (ready.len() == 0) {
+            continue;
+        }
+        match (sys.read_chunk(master, 4096)) {
+            sys.Chunk.Data(b) => {
+                let _ = sys.write_all(master, board.sketch_feed(s, b, 115200), 1000);
+            },
+            _ => time.sleep(5),
+        }
+    }
+}
+
+@test
+fn expect_script_against_a_fiber_board() {
+    let pair = pty.open_pair().unwrap();
+    let p = port.open_port(pair.slave_path, termios.default_config()).unwrap();
+    let m = pair.master;
+    let t = spawn(fn() {
+        serve_sketch(m, 1500);
+    });
+    let lines = script.parse("timeout 1s\nsendline led on\nexpect \"LED ON\"\nsendline ping\nexpect /p.ng/\n")
+        .unwrap();
+    assert_eq(runner.run(p, lines, false, 1000), Result.Ok(2));
+    let bad = script.parse("timeout 200ms\nexpect \"never\"\n").unwrap();
+    match (runner.run(p, bad, false, 1000)) {
+        Result.Ok(_) => panic("expected a timeout"),
+        Result.Err(e) => assert(e.starts_with("line 2: timeout (200 ms)")),
+    }
+    join(t);
+    port.close_port(p);
+    sys.close_fd(m);
+}

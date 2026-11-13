@@ -1,0 +1,513 @@
+//! `struct termios` by hand: its C layout per platform, the flag constants,
+//! the baud-rate encoding and the pure transformations (raw mode, a serial
+//! configuration) that the tests check without a device.
+//!
+//! macOS (arm64/x86_64): tcflag_t and speed_t are `unsigned long` (8 octets),
+//! NCCS = 20 → iflag@0 oflag@8 cflag@16 lflag@24 cc@32 ispeed@56 ospeed@64,
+//! 72 octets. Speeds are the plain numbers (B9600 == 9600).
+//! Linux (glibc): tcflag_t/speed_t are 32 bits, c_line@16, NCCS = 32 →
+//! cc@17 ispeed@52 ospeed@56, 60 octets. Speeds are codes (B115200 = 0o10002).
+
+import sys;
+import std/ffi;
+
+/// A decoded `struct termios`. `ispeed`/`ospeed` hold the platform's raw
+/// speed_t (see `baud_of` / `speed_code`).
+pub struct Termios {
+    iflag: int,
+    oflag: int,
+    cflag: int,
+    lflag: int,
+    cc: [int],
+    ispeed: int,
+    ospeed: int,
+}
+
+/// Where each field lives, per platform.
+pub struct Layout {
+    size: int,
+    width: int,
+    cc_off: int,
+    ncc: int,
+    ispeed_off: int,
+    ospeed_off: int,
+    linux: bool,
+}
+
+pub fn layout_for(linux: bool) -> Layout {
+    if (linux) {
+        Layout {
+            size: 60,
+            width: 4,
+            cc_off: 17,
+            ncc: 32,
+            ispeed_off: 52,
+            ospeed_off: 56,
+            linux: true
+        }
+    } else {
+        Layout {
+            size: 72,
+            width: 8,
+            cc_off: 32,
+            ncc: 20,
+            ispeed_off: 56,
+            ospeed_off: 64,
+            linux: false
+        }
+    }
+}
+
+pub fn layout() -> Layout {
+    layout_for(sys.is_linux())
+}
+
+/// The flag bits rayserial touches, per platform.
+pub struct Flags {
+    ignbrk: int,
+    brkint: int,
+    ignpar: int,
+    parmrk: int,
+    inpck: int,
+    istrip: int,
+    inlcr: int,
+    igncr: int,
+    icrnl: int,
+    ixon: int,
+    ixoff: int,
+    ixany: int,
+    opost: int,
+    csize: int,
+    cs5: int,
+    cs6: int,
+    cs7: int,
+    cs8: int,
+    cstopb: int,
+    cread: int,
+    parenb: int,
+    parodd: int,
+    hupcl: int,
+    clocal: int,
+    crtscts: int,
+    echo: int,
+    echonl: int,
+    icanon: int,
+    isig: int,
+    iexten: int,
+    vmin: int,
+    vtime: int,
+    tcsanow: int,
+    tcsadrain: int,
+    tciflush: int,
+    tcioflush: int,
+}
+
+pub fn flags_for(linux: bool) -> Flags {
+    if (linux) {
+        Flags {
+            ignbrk: 0o1,
+            brkint: 0o2,
+            ignpar: 0o4,
+            parmrk: 0o10,
+            inpck: 0o20,
+            istrip: 0o40,
+            inlcr: 0o100,
+            igncr: 0o200,
+            icrnl: 0o400,
+            ixon: 0o2000,
+            ixoff: 0o10000,
+            ixany: 0o4000,
+            opost: 0o1,
+            csize: 0o60,
+            cs5: 0,
+            cs6: 0o20,
+            cs7: 0o40,
+            cs8: 0o60,
+            cstopb: 0o100,
+            cread: 0o200,
+            parenb: 0o400,
+            parodd: 0o1000,
+            hupcl: 0o2000,
+            clocal: 0o4000,
+            crtscts: 0o20000000000,
+            echo: 0o10,
+            echonl: 0o100,
+            icanon: 0o2,
+            isig: 0o1,
+            iexten: 0o100000,
+            vmin: 6,
+            vtime: 5,
+            tcsanow: 0,
+            tcsadrain: 1,
+            tciflush: 0,
+            tcioflush: 2
+        }
+    } else {
+        Flags {
+            ignbrk: 0x1,
+            brkint: 0x2,
+            ignpar: 0x4,
+            parmrk: 0x8,
+            inpck: 0x10,
+            istrip: 0x20,
+            inlcr: 0x40,
+            igncr: 0x80,
+            icrnl: 0x100,
+            ixon: 0x200,
+            ixoff: 0x400,
+            ixany: 0x800,
+            opost: 0x1,
+            csize: 0x300,
+            cs5: 0,
+            cs6: 0x100,
+            cs7: 0x200,
+            cs8: 0x300,
+            cstopb: 0x400,
+            cread: 0x800,
+            parenb: 0x1000,
+            parodd: 0x2000,
+            hupcl: 0x4000,
+            clocal: 0x8000,
+            crtscts: 0x30000,
+            echo: 0x8,
+            echonl: 0x10,
+            icanon: 0x100,
+            isig: 0x80,
+            iexten: 0x400,
+            vmin: 16,
+            vtime: 17,
+            tcsanow: 0,
+            tcsadrain: 1,
+            tciflush: 1,
+            tcioflush: 3
+        }
+    }
+}
+
+pub fn flags() -> Flags {
+    flags_for(sys.is_linux())
+}
+
+// --- the C layout -----------------------------------------------------------
+
+fn put(out: [int], off: int, width: int, v: int) {
+    for i in 0..width {
+        out[off + i] = (v >> (8 * i)) & 255;
+    }
+}
+
+pub fn decode_with(b: bytes, l: Layout) -> Termios {
+    var cc: [int] = [];
+    for i in 0..l.ncc {
+        cc.push(b[l.cc_off + i]);
+    }
+    Termios {
+        iflag: sys.read_le(b, 0, l.width),
+        oflag: sys.read_le(b, l.width, l.width),
+        cflag: sys.read_le(b, 2 * l.width, l.width),
+        lflag: sys.read_le(b, 3 * l.width, l.width),
+        cc: cc,
+        ispeed: sys.read_le(b, l.ispeed_off, l.width),
+        ospeed: sys.read_le(b, l.ospeed_off, l.width)
+    }
+}
+
+/// Encodes `t` over `base` (the octets tcgetattr gave), so the fields this
+/// module does not model (Linux c_line, padding) keep their values.
+pub fn encode_with(t: Termios, base: bytes, l: Layout) -> bytes {
+    var out: [int] = [];
+    for i in 0..l.size {
+        out.push(if (i < base.len()) { base[i] } else { 0 });
+    }
+    put(out, 0, l.width, t.iflag);
+    put(out, l.width, l.width, t.oflag);
+    put(out, 2 * l.width, l.width, t.cflag);
+    put(out, 3 * l.width, l.width, t.lflag);
+    for i in 0..l.ncc {
+        out[l.cc_off + i] = if (i < t.cc.len()) { t.cc[i] & 255 } else { 0 };
+    }
+    put(out, l.ispeed_off, l.width, t.ispeed);
+    put(out, l.ospeed_off, l.width, t.ospeed);
+    bytes_of(out)
+}
+
+/// A port's settings as read by tcgetattr: the decoded struct plus the raw
+/// octets (re-encoding goes over them).
+pub struct Snapshot {
+    t: Termios,
+    raw: bytes,
+}
+
+pub fn get(fd: int) -> Result<Snapshot, string> {
+    let l = layout();
+    let buf = ffi.buffer(l.size);
+    if (sys.tcgetattr(fd, buf) != 0) {
+        return Result.Err(sys.last_error("tcgetattr"));
+    }
+    Result.Ok(Snapshot { t: decode_with(buf, l), raw: buf })
+}
+
+pub fn set(fd: int, snap: Snapshot, t: Termios, action: int) -> Result<int, string> {
+    let buf = encode_with(t, snap.raw, layout());
+    if (sys.tcsetattr(fd, action, buf) != 0) {
+        return Result.Err(sys.last_error("tcsetattr"));
+    }
+    Result.Ok(0)
+}
+
+/// Writes back exactly the octets of an earlier snapshot.
+pub fn restore(fd: int, snap: Snapshot) -> Result<int, string> {
+    if (sys.tcsetattr(fd, flags().tcsanow, snap.raw) != 0) {
+        return Result.Err(sys.last_error("tcsetattr"));
+    }
+    Result.Ok(0)
+}
+
+// --- baud rates -------------------------------------------------------------
+
+/// The rates with a Linux B-constant, paired with their code.
+const LINUX_SPEEDS: [(int, int)] = [
+    (0, 0),
+    (50, 0o1),
+    (75, 0o2),
+    (110, 0o3),
+    (134, 0o4),
+    (150, 0o5),
+    (200, 0o6),
+    (300, 0o7),
+    (600, 0o10),
+    (1200, 0o11),
+    (1800, 0o12),
+    (2400, 0o13),
+    (4800, 0o14),
+    (9600, 0o15),
+    (19200, 0o16),
+    (38400, 0o17),
+    (57600, 0o10001),
+    (115200, 0o10002),
+    (230400, 0o10003),
+    (460800, 0o10004),
+    (500000, 0o10005),
+    (576000, 0o10006),
+    (921600, 0o10007),
+    (1000000, 0o10010),
+    (1152000, 0o10011),
+    (1500000, 0o10012),
+    (2000000, 0o10013),
+    (2500000, 0o10014),
+    (3000000, 0o10015),
+    (3500000, 0o10016),
+    (4000000, 0o10017)
+];
+
+/// The rates macOS's termios.h names (B0..B230400). Others need IOSSIOSPEED
+/// on a real driver.
+const MACOS_SPEEDS: [int] = [
+    0,
+    50,
+    75,
+    110,
+    134,
+    150,
+    200,
+    300,
+    600,
+    1200,
+    1800,
+    2400,
+    4800,
+    7200,
+    9600,
+    14400,
+    19200,
+    28800,
+    38400,
+    57600,
+    76800,
+    115200,
+    230400
+];
+
+/// The speed_t to store for `baud`, or None when the platform has no code
+/// for it (Linux: no B-constant; macOS: every value is storable).
+pub fn speed_code_for(baud: int, linux: bool) -> Option<int> {
+    if (!linux) {
+        return Option.Some(baud);
+    }
+    for (b, c) in LINUX_SPEEDS {
+        if (b == baud) {
+            return Option.Some(c);
+        }
+    }
+    Option.None
+}
+
+/// The baud rate a stored speed_t stands for.
+pub fn baud_of_code(code: int, linux: bool) -> int {
+    if (!linux) {
+        return code;
+    }
+    for (b, c) in LINUX_SPEEDS {
+        if (c == code) {
+            return b;
+        }
+    }
+    -1
+}
+
+/// True when the platform's termios.h names this rate.
+pub fn is_standard_baud(baud: int, linux: bool) -> bool {
+    if (linux) { speed_code_for(baud, true).is_some() } else { MACOS_SPEEDS.contains(baud) }
+}
+
+// --- pure transformations -----------------------------------------------------
+
+/// cfmakeraw(3), spelled out: no input/output processing, no echo, no
+/// signals, 8 bits, read returns as soon as one octet is there.
+pub fn make_raw(t: Termios, f: Flags) -> Termios {
+    var cc = [] + t.cc;
+    cc[f.vmin] = 1;
+    cc[f.vtime] = 0;
+    Termios {
+        iflag: t.iflag & ~(f.ignbrk | f.brkint | f.parmrk | f.istrip | f.inlcr | f.igncr | f.icrnl | f.ixon),
+        oflag: t.oflag & ~f.opost,
+        cflag: (t.cflag & ~(f.csize | f.parenb)) | f.cs8,
+        lflag: t.lflag & ~(f.echo | f.echonl | f.icanon | f.isig | f.iexten),
+        cc: cc,
+        ispeed: t.ispeed,
+        ospeed: t.ospeed
+    }
+}
+
+/// A serial line configuration, as given on the command line.
+@derive(Eq, Show)
+pub struct LineConfig {
+    baud: int,
+    data: int,
+    parity: string,
+    stop: int,
+    flow: string,
+}
+
+pub fn default_config() -> LineConfig {
+    LineConfig { baud: 115200, data: 8, parity: "none", stop: 1, flow: "none" }
+}
+
+pub fn validate(c: LineConfig) -> Result<LineConfig, string> {
+    if (c.baud <= 0 || c.baud > 20000000) {
+        return Result.Err("baud out of range: ${c.baud}");
+    }
+    if (c.data < 5 || c.data > 8) {
+        return Result.Err("data bits must be 5..8, not ${c.data}");
+    }
+    if (!["none", "even", "odd"].contains(c.parity)) {
+        return Result.Err("parity must be none|even|odd, not ${c.parity}");
+    }
+    if (c.stop != 1 && c.stop != 2) {
+        return Result.Err("stop bits must be 1 or 2, not ${c.stop}");
+    }
+    if (!["none", "rtscts", "xonxoff"].contains(c.flow)) {
+        return Result.Err("flow must be none|rtscts|xonxoff, not ${c.flow}");
+    }
+    Result.Ok(c)
+}
+
+/// Raw mode plus the line configuration: frame, parity, flow control,
+/// receiver on, modem lines ignored (CLOCAL). The speed is set separately
+/// (`with_speed`) because a non-standard rate may need an ioctl.
+pub fn configure(t: Termios, c: LineConfig, f: Flags) -> Termios {
+    let r = make_raw(t, f);
+    let size = match (c.data) {
+        5 => f.cs5,
+        6 => f.cs6,
+        7 => f.cs7,
+        _ => f.cs8,
+    };
+    var cflag = (r.cflag & ~(f.csize | f.parenb | f.parodd | f.cstopb | f.crtscts)) | size | f.cread | f.clocal;
+    if (c.parity != "none") {
+        cflag = cflag | f.parenb;
+    }
+    if (c.parity == "odd") {
+        cflag = cflag | f.parodd;
+    }
+    if (c.stop == 2) {
+        cflag = cflag | f.cstopb;
+    }
+    if (c.flow == "rtscts") {
+        cflag = cflag | f.crtscts;
+    }
+    var iflag = r.iflag & ~(f.ixon | f.ixoff | f.ixany | f.inpck | f.ignpar);
+    if (c.flow == "xonxoff") {
+        iflag = iflag | f.ixon | f.ixoff;
+    }
+    if (c.parity != "none") {
+        iflag = iflag | f.inpck;
+    }
+    Termios {
+        iflag: iflag,
+        oflag: r.oflag,
+        cflag: cflag,
+        lflag: r.lflag,
+        cc: r.cc,
+        ispeed: r.ispeed,
+        ospeed: r.ospeed
+    }
+}
+
+pub fn with_speed(t: Termios, code: int) -> Termios {
+    Termios {
+        iflag: t.iflag,
+        oflag: t.oflag,
+        cflag: t.cflag,
+        lflag: t.lflag,
+        cc: t.cc,
+        ispeed: code,
+        ospeed: code
+    }
+}
+
+/// Reads the line configuration back out of a termios (what `rayserial
+/// open` prints, and what the tests compare).
+pub fn describe_config(t: Termios, f: Flags, linux: bool) -> LineConfig {
+    let size = t.cflag & f.csize;
+    let data = if (size == f.cs8) {
+        8
+    } else if (size == f.cs7) {
+        7
+    } else if (size == f.cs6) {
+        6
+    } else {
+        5
+    };
+    let parity = if ((t.cflag & f.parenb) == 0) {
+        "none"
+    } else if ((t.cflag & f.parodd) != 0) {
+        "odd"
+    } else {
+        "even"
+    };
+    let flow = if ((t.cflag & f.crtscts) == f.crtscts) {
+        "rtscts"
+    } else if ((t.iflag & f.ixon) != 0) {
+        "xonxoff"
+    } else {
+        "none"
+    };
+    LineConfig {
+        baud: baud_of_code(t.ospeed, linux),
+        data: data,
+        parity: parity,
+        stop: if ((t.cflag & f.cstopb) != 0) { 2 } else { 1 },
+        flow: flow
+    }
+}
+
+/// "115200 8N1 flow=none"
+pub fn summary(c: LineConfig) -> string {
+    let p = match (c.parity) {
+        "even" => "E",
+        "odd" => "O",
+        _ => "N",
+    };
+    "${c.baud} ${c.data}${p}${c.stop} flow=${c.flow}"
+}

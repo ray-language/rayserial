@@ -1,0 +1,230 @@
+//! A serial port: open, configure (termios + the macOS IOSSIOSPEED ioctl for
+//! non-standard rates), change baud, drive DTR/RTS, restore and close.
+
+import sys;
+import termios;
+import std/time;
+from termios import LineConfig, Snapshot;
+
+/// An open, configured port. `saved` is what the port had before we touched
+/// it (restored on close). `speed_note` says how the speed was set.
+pub struct Port {
+    fd: int,
+    path: string,
+    saved: Snapshot,
+    config: LineConfig,
+    speed_note: string,
+    dtr: bool,
+    rts: bool,
+}
+
+// <sys/ioctl.h> / <IOKit/serial/ioss.h> requests.
+const MAC_IOSSIOSPEED: int = 0x80085402;
+
+const MAC_TIOCMGET: int = 0x4004746A;
+
+const MAC_TIOCMBIS: int = 0x8004746C;
+
+const MAC_TIOCMBIC: int = 0x8004746B;
+
+const LINUX_TIOCMGET: int = 0x5415;
+
+const LINUX_TIOCMBIS: int = 0x5416;
+
+const LINUX_TIOCMBIC: int = 0x5417;
+
+pub const TIOCM_DTR: int = 0x2;
+
+pub const TIOCM_RTS: int = 0x4;
+
+/// Opens without blocking on carrier (O_NONBLOCK; the fd stays non-blocking
+/// and every read/write goes through poll), checks it is a tty, configures.
+pub fn open_port(path: string, c: LineConfig) -> Result<Port, string> {
+    let cfg = termios.validate(c)?;
+    let flags = sys.o_rdwr() | sys.o_noctty() | sys.o_nonblock() | sys.o_cloexec();
+    let fd = sys.open(path, flags);
+    if (fd < 0) {
+        return Result.Err(sys.last_error("open ${path}"));
+    }
+    if (!sys.is_a_tty(fd)) {
+        sys.close_fd(fd);
+        return Result.Err("${path} is not a terminal device");
+    }
+    let saved = match (termios.get(fd)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => {
+            sys.close_fd(fd);
+            return Result.Err(e);
+        },
+    };
+    var p = Port {
+        fd: fd,
+        path: path,
+        saved: saved,
+        config: cfg,
+        speed_note: "",
+        dtr: true,
+        rts: true
+    };
+    match (apply(p, cfg)) {
+        Result.Ok(note) => p.speed_note = note,
+        Result.Err(e) => {
+            sys.close_fd(fd);
+            return Result.Err(e);
+        },
+    }
+    sys.tcflush(fd, termios.flags().tciflush);
+    Result.Ok(p)
+}
+
+/// Applies a full line configuration. Returns how the speed got set.
+pub fn apply(p: Port, c: LineConfig) -> Result<string, string> {
+    let f = termios.flags();
+    let linux = sys.is_linux();
+    let snap = termios.get(p.fd)?;
+    let t = termios.configure(snap.t, c, f);
+    let note = set_speed_on(p.fd, snap, t, c.baud, linux)?;
+    p.config = c;
+    Result.Ok(note)
+}
+
+/// Sets `baud` over termios `t` (already configured). Standard rates go
+/// through tcsetattr. A non-standard rate on macOS goes through
+/// IOSSIOSPEED after a tcsetattr at a placeholder rate (what Apple's
+/// sample code does); when the driver refuses it (a pty → ENOTTY) the rate
+/// is stored in termios directly, which ptys accept.
+fn set_speed_on(
+    fd: int,
+    snap: Snapshot,
+    t: termios.Termios,
+    baud: int,
+    linux: bool
+) -> Result<string, string> {
+    if (termios.is_standard_baud(baud, linux)) {
+        let code = termios.speed_code_for(baud, linux).unwrap();
+        termios.set(fd, snap, termios.with_speed(t, code), termios.flags().tcsanow)?;
+        return Result.Ok("termios");
+    }
+    if (linux) {
+        // BOTHER + termios2 (TCSETS2) would do it; not wired: see README.
+        return Result.Err(
+            "baud ${baud} has no B-constant on Linux (termios2/BOTHER not implemented)"
+        );
+    }
+    termios.set(fd, snap, termios.with_speed(t, 9600), termios.flags().tcsanow)?;
+    let arg = bytes_of(sys.le32(baud) + [0, 0, 0, 0]);
+    let code = sys.ioctl_code(fd, MAC_IOSSIOSPEED, arg);
+    if (code == 0) {
+        return Result.Ok("IOSSIOSPEED");
+    }
+    termios.set(fd, snap, termios.with_speed(t, baud), termios.flags().tcsanow)?;
+    Result.Ok("termios (IOSSIOSPEED: ${sys.describe("refused", code)})")
+}
+
+pub fn set_baud(p: Port, baud: int) -> Result<string, string> {
+    let c = LineConfig {
+        baud: baud,
+        data: p.config.data,
+        parity: p.config.parity,
+        stop: p.config.stop,
+        flow: p.config.flow
+    };
+    let checked = termios.validate(c)?;
+    let note = apply(p, checked)?;
+    p.speed_note = note;
+    Result.Ok(note)
+}
+
+/// What the port reports now (tcgetattr), as a line configuration.
+pub fn current(fd: int) -> Result<LineConfig, string> {
+    let s = termios.get(fd)?;
+    Result.Ok(termios.describe_config(s.t, termios.flags(), sys.is_linux()))
+}
+
+fn modem_request(set: bool, get: bool) -> int {
+    let linux = sys.is_linux();
+    if (get) {
+        return if (linux) { LINUX_TIOCMGET } else { MAC_TIOCMGET };
+    }
+    if (set) {
+        if (linux) { LINUX_TIOCMBIS } else { MAC_TIOCMBIS }
+    } else {
+        if (linux) { LINUX_TIOCMBIC } else { MAC_TIOCMBIC }
+    }
+}
+
+/// Reads the modem lines (TIOCMGET). Err on devices without them (ptys).
+pub fn modem_bits(fd: int) -> Result<int, string> {
+    let arg = bytes_of([0, 0, 0, 0]);
+    let code = sys.ioctl_code(fd, modem_request(false, true), arg);
+    if (code != 0) {
+        return Result.Err(sys.describe("TIOCMGET", code));
+    }
+    Result.Ok(sys.read_le(arg, 0, 4))
+}
+
+/// Raises or drops one modem line with TIOCMBIS/TIOCMBIC. Returns the
+/// errno (0 = done).
+fn modem_line(fd: int, bit: int, on: bool) -> int {
+    sys.ioctl_code(fd, modem_request(on, false), bytes_of(sys.le32(bit)))
+}
+
+/// Sets DTR. Ports without modem ioctls (ptys) fall back to the POSIX way:
+/// output speed 0 hangs up (drops DTR), the configured speed raises it.
+pub fn set_dtr(p: Port, on: bool) -> Result<string, string> {
+    let code = modem_line(p.fd, TIOCM_DTR, on);
+    if (code == 0) {
+        p.dtr = on;
+        return Result.Ok("TIOCM");
+    }
+    if (code != sys.ENOTTY && code != 22) {
+        return Result.Err(sys.describe("DTR", code));
+    }
+    let snap = termios.get(p.fd)?;
+    if (on) {
+        let note = set_speed_on(p.fd, snap, snap.t, p.config.baud, sys.is_linux())?;
+        p.dtr = true;
+        return Result.Ok("B0 hangup (${note})");
+    }
+    termios.set(p.fd, snap, termios.with_speed(snap.t, 0), termios.flags().tcsanow)?;
+    p.dtr = false;
+    Result.Ok("B0 hangup")
+}
+
+pub fn set_rts(p: Port, on: bool) -> Result<string, string> {
+    let code = modem_line(p.fd, TIOCM_RTS, on);
+    if (code != 0) {
+        return Result.Err(sys.describe("RTS", code));
+    }
+    p.rts = on;
+    Result.Ok("TIOCM")
+}
+
+/// The Arduino reset: DTR low for `ms`, then high again.
+pub fn pulse_dtr(p: Port, ms: int) -> Result<string, string> {
+    let how = set_dtr(p, false)?;
+    time.sleep(ms);
+    set_dtr(p, true)?;
+    Result.Ok(how)
+}
+
+pub fn send_break(p: Port) -> Result<int, string> {
+    if (sys.tcsendbreak(p.fd, 0) != 0) {
+        return Result.Err(sys.last_error("tcsendbreak"));
+    }
+    Result.Ok(0)
+}
+
+/// Waits until the output queue is on the wire.
+pub fn drain(p: Port) -> Result<int, string> {
+    if (sys.tcdrain(p.fd) != 0) {
+        return Result.Err(sys.last_error("tcdrain"));
+    }
+    Result.Ok(0)
+}
+
+/// Restores what the port had and closes it.
+pub fn close_port(p: Port) {
+    let _ = termios.restore(p.fd, p.saved);
+    sys.close_fd(p.fd);
+}

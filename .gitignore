@@ -1,0 +1,10 @@
+# dependencies downloaded by the package manager
+.ray-deps/
+# the device link of `ray dev --device` (port + token)
+.ray-dev
+
+# the native binary (make build)
+/rayserial
+# scratch output of the test and bench scripts
+/out/
+__pycache__/

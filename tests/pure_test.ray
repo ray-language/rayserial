@@ -1,0 +1,364 @@
+// Pure logic: termios layout and flags, baud tables, the escape-key state
+// machine, the views, the expect script parser, the sketch.
+
+import board;
+import keys;
+import ports;
+import script;
+import termios;
+import transfer;
+import view;
+from keys import Action, Mode;
+from script import Step;
+from termios import LineConfig, Termios;
+
+fn sample(linux: bool) -> Termios {
+    let l = termios.layout_for(linux);
+    var cc: [int] = [];
+    for i in 0..l.ncc {
+        cc.push(i + 1);
+    }
+    Termios {
+        iflag: 0x2B02,
+        oflag: 0x3,
+        cflag: 0x4B00,
+        lflag: 0x5CB,
+        cc: cc,
+        ispeed: 9600,
+        ospeed: 9600
+    }
+}
+
+@test
+fn termios_roundtrip_macos_and_linux() {
+    for linux in [false, true] {
+        let l = termios.layout_for(linux);
+        let t = sample(linux);
+        var base: [int] = [];
+        for i in 0..l.size {
+            base.push(200 + i % 50);
+        }
+        let b = termios.encode_with(t, bytes_of(base), l);
+        assert_eq(b.len(), l.size);
+        let back = termios.decode_with(b, l);
+        assert_eq(back.iflag, t.iflag);
+        assert_eq(back.cflag, t.cflag);
+        assert_eq(back.lflag, t.lflag);
+        assert_eq(back.cc, t.cc);
+        assert_eq(back.ospeed, 9600);
+        if (linux) {
+            // c_line (offset 16) is not modelled: it keeps the base octet.
+            assert_eq(b[16], base[16]);
+        }
+    }
+}
+
+@test
+fn termios_macos_offsets() {
+    let l = termios.layout_for(false);
+    let t = sample(false);
+    let b = termios.encode_with(t, b"", l);
+    // speed_t at 56 and 64, little-endian 9600 = 0x2580
+    assert_eq(b[56], 0x80);
+    assert_eq(b[57], 0x25);
+    assert_eq(b[64], 0x80);
+    assert_eq(b[32], 1);
+    assert_eq(b[16], 0x00);
+    assert_eq(b[17], 0x4B);
+}
+
+@test
+fn raw_mode_clears_processing() {
+    for linux in [false, true] {
+        let f = termios.flags_for(linux);
+        let r = termios.make_raw(sample(linux), f);
+        assert_eq(r.lflag & (f.icanon | f.echo | f.isig | f.iexten), 0);
+        assert_eq(r.oflag & f.opost, 0);
+        assert_eq(r.iflag & (f.icrnl | f.ixon | f.istrip), 0);
+        assert_eq(r.cflag & f.csize, f.cs8);
+        assert_eq(r.cc[f.vmin], 1);
+        assert_eq(r.cc[f.vtime], 0);
+    }
+}
+
+@test
+fn configure_and_describe_agree() {
+    let cases = [
+        LineConfig { baud: 115200, data: 8, parity: "none", stop: 1, flow: "none" },
+        LineConfig { baud: 9600, data: 7, parity: "even", stop: 1, flow: "none" },
+        LineConfig { baud: 57600, data: 8, parity: "odd", stop: 2, flow: "rtscts" },
+        LineConfig { baud: 19200, data: 5, parity: "none", stop: 1, flow: "xonxoff" },
+        LineConfig { baud: 300, data: 6, parity: "odd", stop: 2, flow: "none" }
+    ];
+    for linux in [false, true] {
+        let f = termios.flags_for(linux);
+        for c in cases {
+            let code = termios.speed_code_for(c.baud, linux).unwrap();
+            let t = termios.with_speed(termios.configure(sample(linux), c, f), code);
+            assert_eq(termios.describe_config(t, f, linux), c);
+            assert((t.cflag & f.cread) != 0);
+            assert((t.cflag & f.clocal) != 0);
+        }
+    }
+}
+
+@test
+fn parity_and_flow_bits_macos() {
+    let f = termios.flags_for(false);
+    let c = LineConfig { baud: 9600, data: 7, parity: "odd", stop: 2, flow: "rtscts" };
+    let t = termios.configure(sample(false), c, f);
+    assert_eq(t.cflag & 0x300, 0x200);
+    assert_eq(t.cflag & 0x3000, 0x3000);
+    assert_eq(t.cflag & 0x400, 0x400);
+    assert_eq(t.cflag & 0x30000, 0x30000);
+    let x = termios.configure(
+        sample(false),
+        LineConfig { baud: 9600, data: 8, parity: "none", stop: 1, flow: "xonxoff" },
+        f
+    );
+    assert_eq(x.iflag & 0x600, 0x600);
+    assert_eq(x.cflag & 0x30000, 0);
+}
+
+@test
+fn baud_tables() {
+    assert_eq(termios.speed_code_for(115200, true), Option.Some(0o10002));
+    assert_eq(termios.speed_code_for(9600, true), Option.Some(0o15));
+    assert_eq(termios.speed_code_for(250000, true), Option.None);
+    assert_eq(termios.speed_code_for(250000, false), Option.Some(250000));
+    assert_eq(termios.baud_of_code(0o10007, true), 921600);
+    assert(termios.is_standard_baud(230400, false));
+    assert(!termios.is_standard_baud(460800, false));
+    assert(!termios.is_standard_baud(250000, false));
+    assert(termios.is_standard_baud(4000000, true));
+}
+
+@test
+fn validate_rejects_nonsense() {
+    let d = termios.default_config();
+    assert(termios.validate(d).is_ok());
+    assert(termios.validate(LineConfig { baud: 9600, data: 9, parity: "none", stop: 1, flow: "none" })
+        .is_err());
+    assert(termios.validate(LineConfig { baud: 9600, data: 8, parity: "mark", stop: 1, flow: "none" })
+        .is_err());
+    assert(termios.validate(LineConfig { baud: 0, data: 8, parity: "none", stop: 1, flow: "none" })
+        .is_err());
+    assert(termios.validate(LineConfig { baud: 9600, data: 8, parity: "none", stop: 3, flow: "none" })
+        .is_err());
+    assert(termios.validate(LineConfig { baud: 9600, data: 8, parity: "none", stop: 1, flow: "dsrdtr" })
+        .is_err());
+    assert_eq(
+        termios.summary(LineConfig { baud: 9600, data: 7, parity: "even", stop: 1, flow: "none" }),
+        "9600 7E1 flow=none"
+    );
+}
+
+fn sends(actions: [Action]) -> bytes {
+    var out: [bytes] = [];
+    for a in actions {
+        match (a) {
+            Action.Send(b) => out.push(b),
+            _ => { },
+        }
+    }
+    bytes_concat(out)
+}
+
+@test
+fn keys_plain_text_and_crlf() {
+    let (m, a) = keys.feed(Mode.Normal, b"led on\r", false);
+    assert_eq(sends(a), b"led on\r");
+    let (_, a2) = keys.feed(Mode.Normal, b"led on\r", true);
+    assert_eq(sends(a2), b"led on\r\n");
+    match (m) {
+        Mode.Normal => { },
+        _ => panic("expected normal mode"),
+    }
+}
+
+@test
+fn keys_escape_commands() {
+    let (_, a) = keys.feed(Mode.Normal, b"ab\x01xcd", false);
+    assert_eq(a.len(), 3);
+    assert_eq(sends([a[0]]), b"ab");
+    match (a[1]) {
+        Action.Quit => { },
+        _ => panic("expected quit"),
+    }
+    // Ctrl-A Ctrl-A sends one Ctrl-A
+    let (_, b) = keys.feed(Mode.Normal, b"\x01\x01", false);
+    assert_eq(sends(b), b"\x01");
+    // the prefix may arrive alone, the letter in the next burst
+    let (m1, c1) = keys.feed(Mode.Normal, b"\x01", false);
+    assert_eq(c1.len(), 0);
+    let (_, c2) = keys.feed(m1, b"h", false);
+    match (c2[0]) {
+        Action.ToggleHex => { },
+        _ => panic("expected hex toggle"),
+    }
+}
+
+@test
+fn keys_baud_prompt() {
+    let (m, a) = keys.feed(Mode.Normal, b"\x01b96", false);
+    match (m) {
+        Mode.Baud(acc) => assert_eq(acc, "96"),
+        _ => panic("expected baud prompt"),
+    }
+    let (m2, b) = keys.feed(m, b"0\x7f00\r", false);
+    var baud = 0;
+    for x in b {
+        match (x) {
+            Action.SetBaud(n) => baud = n,
+            _ => { },
+        }
+    }
+    assert_eq(baud, 9600);
+    match (m2) {
+        Mode.Normal => { },
+        _ => panic("expected normal mode"),
+    }
+    assert(a.len() >= 1);
+    // Esc cancels
+    let (m3, _) = keys.feed(Mode.Baud("12"), b"\x1b", false);
+    match (m3) {
+        Mode.Normal => { },
+        _ => panic("expected cancel"),
+    }
+}
+
+@test
+fn hex_view_keeps_columns() {
+    let (t1, c1) = view.hex_feed(0, b"ABC");
+    assert_eq(t1, "41 42 43 ");
+    assert_eq(c1, 3);
+    var sixteen: [int] = [];
+    for i in 0..13 {
+        sixteen.push(i);
+    }
+    let (t2, c2) = view.hex_feed(c1, bytes_of(sixteen));
+    assert(t2.ends_with("0c\r\n"));
+    assert_eq(c2, 0);
+    assert_eq(view.hex2(255), "ff");
+}
+
+@test
+fn crlf_view_across_bursts() {
+    let (a, cr) = view.lf_to_crlf(false, b"x\ny\r");
+    assert_eq(a, b"x\r\ny\r");
+    assert(cr);
+    let (b, _) = view.lf_to_crlf(cr, b"\nz\n");
+    assert_eq(b, b"\nz\r\n");
+    assert_eq(view.escaped(b"a\r\n\x00\xff\\"), "a\\r\\n\\x00\\xff\\\\");
+    assert_eq(view.latin1(b"\xe9A").len(), 2);
+}
+
+@test
+fn script_parses_every_command() {
+    let text = `# demo
+timeout 2s
+reset
+reset 250ms
+expect "ready"
+expect /n=\\d+/
+sendline led on
+send "a\\tb\\x41\\\\\\"\\0"
+sleep 1.5s
+sleep 20
+baud 9600
+flush
+log hello there
+`;
+    let lines = script.parse(text).unwrap();
+    assert_eq(lines.len(), 12);
+    assert_eq(lines[0].no, 2);
+    match (lines[1].step) {
+        Step.Reset(ms) => assert_eq(ms, 100),
+        _ => panic("reset"),
+    }
+    match (lines[5].step) {
+        Step.Send(b) => assert_eq(b, b"led on\r\n"),
+        _ => panic("sendline"),
+    }
+    match (lines[6].step) {
+        Step.Send(b) => assert_eq(b, b"a\tbA\\\"\x00"),
+        _ => panic("send"),
+    }
+    match (lines[4].step) {
+        Step.ExpectRe(p) => assert_eq(p, "n=\\d+"),
+        _ => panic("regex"),
+    }
+    match (lines[7].step) {
+        Step.Sleep(ms) => assert_eq(ms, 1500),
+        _ => panic("sleep"),
+    }
+}
+
+fn err_of(r: Result<[script.Line], string>) -> string {
+    match (r) {
+        Result.Ok(_) => "ok",
+        Result.Err(e) => e,
+    }
+}
+
+@test
+fn script_errors_name_the_line() {
+    assert_eq(
+        err_of(script.parse("sleep 1s\nfrobnicate\n")),
+        "line 2: unknown command 'frobnicate'"
+    );
+    assert(script.parse("send \"abc").is_err());
+    assert(script.parse("send \"\\q\"").is_err());
+    assert(script.parse("expect").is_err());
+    assert(script.parse("baud fast").is_err());
+    assert_eq(script.parse_duration("250ms"), Result.Ok(250));
+    assert_eq(script.parse_duration("2s"), Result.Ok(2000));
+}
+
+@test
+fn sketch_answers_like_an_arduino() {
+    let s = board.new_sketch();
+    let out = board.sketch_feed(s, b"led on\r", 115200);
+    assert_eq(out, b"led on\r\nLED ON\r\n");
+    assert(s.led);
+    // a command split over two bursts, with a backspace
+    let a = board.sketch_feed(s, b"pinx\x7f", 115200);
+    assert_eq(a, b"pinx\x08 \x08");
+    let b = board.sketch_feed(s, b"g\r", 115200);
+    assert_eq(b, b"g\r\npong\r\n");
+    assert_eq(board.answer(s, "baud?", 9600), b"baud 9600\r\n");
+    assert_eq(board.answer(s, "LED?", 9600), b"LED is ON\r\n");
+    let d = board.answer(s, "dump 300", 9600);
+    assert(d.starts_with(b"BEGIN 300\r\n"));
+    assert_eq(d.len(), 11 + 300 + 7);
+    assert_eq(d[11 + 255], 255);
+    assert_eq(board.answer(s, "nope", 1), b"ERR unknown command: nope\r\n");
+    assert_eq(board.sensor_line(3), "sensor n=3 temp=23.3 hum=43\r\n");
+}
+
+@test
+fn port_names() {
+    assert(ports.is_serial_name("cu.usbmodem14101"));
+    assert(ports.is_serial_name("ttyUSB0"));
+    assert(ports.is_serial_name("ttyACM1"));
+    assert(!ports.is_serial_name("ttys004"));
+    assert(
+        !ports.is_serial_name("tty.Bluetooth-Incoming-Port")
+            && ports.is_serial_name("tty.usbserial-0001")
+    );
+    assert_eq(ports.kind_of("cu.usbmodem14101"), "usb");
+    assert_eq(ports.kind_of("cu.SLAB_USBtoUART"), "usb");
+    assert_eq(ports.kind_of("cu.Bluetooth-Incoming-Port"), "bluetooth");
+    assert_eq(ports.kind_of("cu.debug-console"), "system");
+}
+
+@test
+fn timestamps_prefix_each_line() {
+    let (a, st) = transfer.stamp_lines(true, b"one\ntw", "[T] ");
+    assert_eq(a, b"[T] one\n[T] tw");
+    assert(!st);
+    let (b, st2) = transfer.stamp_lines(st, b"o\n", "[U] ");
+    assert_eq(b, b"o\n");
+    assert(st2);
+    assert_eq(transfer.rate_line(2048, 1000), "2048 bytes in 1000 ms (2.0 KB/s)");
+}

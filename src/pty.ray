@@ -1,0 +1,61 @@
+//! Pseudo-terminal pairs (posix_openpt), the stand-in for a board.
+
+import sys;
+import termios;
+
+/// The master side (what the fake board reads and writes) and the slave
+/// path (what rayserial opens as if it were /dev/cu.usbmodem…).
+pub struct Pair {
+    master: int,
+    slave_path: string,
+}
+
+/// A new pty pair. The master is non-blocking.
+pub fn open_pair() -> Result<Pair, string> {
+    let m = sys.posix_openpt(sys.o_rdwr() | sys.o_noctty() | sys.o_nonblock() | sys.o_cloexec());
+    if (m < 0) {
+        return Result.Err(sys.last_error("posix_openpt"));
+    }
+    if (sys.grantpt(m) != 0) {
+        let e = sys.last_error("grantpt");
+        sys.close_fd(m);
+        return Result.Err(e);
+    }
+    if (sys.unlockpt(m) != 0) {
+        let e = sys.last_error("unlockpt");
+        sys.close_fd(m);
+        return Result.Err(e);
+    }
+    match (sys.ptsname(m)) {
+        Option.Some(name) => Result.Ok(Pair { master: m, slave_path: name }),
+        Option.None => {
+            let e = sys.last_error("ptsname");
+            sys.close_fd(m);
+            Result.Err(e)
+        },
+    }
+}
+
+/// Opens the slave and leaves it raw, so nothing the board writes is echoed
+/// back by the line discipline before a client configures it. The fd is
+/// kept open by the board: with it the slave never "hangs up" between
+/// clients (no EIO on the master).
+pub fn hold_slave(p: Pair) -> Result<int, string> {
+    let fd = sys.open(
+        p.slave_path,
+        sys.o_rdwr() | sys.o_noctty() | sys.o_nonblock() | sys.o_cloexec()
+    );
+    if (fd < 0) {
+        return Result.Err(sys.last_error("open ${p.slave_path}"));
+    }
+    let snap = termios.get(fd)?;
+    termios.set(fd, snap, termios.make_raw(snap.t, termios.flags()), termios.flags().tcsanow)?;
+    Result.Ok(fd)
+}
+
+/// The settings a client applied on the slave, read from the master (the
+/// pair shares one termios). Speed 0 = the client dropped DTR (B0 hangup).
+pub fn peer_config(master: int) -> Result<termios.LineConfig, string> {
+    let s = termios.get(master)?;
+    Result.Ok(termios.describe_config(s.t, termios.flags(), sys.is_linux()))
+}

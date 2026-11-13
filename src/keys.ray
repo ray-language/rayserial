@@ -1,0 +1,111 @@
+//! The keyboard side of `rayserial open`: a pure state machine that turns
+//! the octets typed on the local (raw) terminal into what goes to the port
+//! and the escape commands (Ctrl-A then a letter, like picocom/screen).
+
+/// Ctrl-A, the escape prefix.
+pub const ESCAPE: int = 0x01;
+
+pub enum Mode {
+    Normal,
+    Escape,
+    Baud(string),
+}
+
+pub enum Action {
+    Send(bytes),
+    Quit,
+    SetBaud(int),
+    ToggleHex,
+    ToggleDtr,
+    ToggleRts,
+    PulseDtr,
+    Break,
+    Status,
+    Help,
+    Show(string),
+}
+
+pub const HELP: string = "\r\n*** rayserial escape keys (Ctrl-A then):\r\n***   x quit   b baud   h hex view   t toggle DTR   r toggle RTS\r\n***   p pulse DTR (Arduino reset)   k send break   s status   ? help\r\n***   Ctrl-A send a literal Ctrl-A\r\n";
+
+/// The new mode and the actions for one burst of typed octets. With `crlf`,
+/// Enter (CR) goes out as CR LF.
+pub fn feed(mode: Mode, chunk: bytes, crlf: bool) -> (Mode, [Action]) {
+    var m = mode;
+    var out: [Action] = [];
+    var pending: [int] = [];
+    for b in chunk {
+        match (m) {
+            Mode.Normal => {
+                if (b == ESCAPE) {
+                    flush(out, pending);
+                    pending = [];
+                    m = Mode.Escape;
+                } else if (crlf && b == 0x0D) {
+                    pending.push(0x0D);
+                    pending.push(0x0A);
+                } else {
+                    pending.push(b);
+                }
+            },
+            Mode.Escape => {
+                m = Mode.Normal;
+                if (b == ESCAPE) {
+                    pending.push(ESCAPE);
+                } else {
+                    let c = char_from_code(b).unwrap_or('?');
+                    match (c) {
+                        'x' => out.push(Action.Quit),
+                        'q' => out.push(Action.Quit),
+                        '\x18' => out.push(Action.Quit),
+                        'h' => out.push(Action.ToggleHex),
+                        't' => out.push(Action.ToggleDtr),
+                        'r' => out.push(Action.ToggleRts),
+                        'p' => out.push(Action.PulseDtr),
+                        'k' => out.push(Action.Break),
+                        's' => out.push(Action.Status),
+                        '?' => out.push(Action.Help),
+                        'b' => {
+                            out.push(Action.Show("\r\n*** new baud rate: "));
+                            m = Mode.Baud("");
+                        },
+                        _ => out.push(Action.Show("\r\n*** unknown escape key (Ctrl-A ? for help)\r\n")),
+                    }
+                }
+            },
+            Mode.Baud(acc) => {
+                if (b >= 0x30 && b <= 0x39) {
+                    let d = char_from_code(b).unwrap_or('0');
+                    out.push(Action.Show("${d}"));
+                    m = Mode.Baud("${acc}${d}");
+                } else if ((b == 0x7F || b == 0x08) && acc.len() > 0) {
+                    out.push(Action.Show("\x08 \x08"));
+                    m = Mode.Baud(acc.substring(0, acc.len() - 1));
+                } else if (b == 0x0D || b == 0x0A) {
+                    m = Mode.Normal;
+                    match (parse_int(acc)) {
+                        Option.Some(n) => {
+                            if (n > 0) {
+                                out.push(Action.Show("\r\n"));
+                                out.push(Action.SetBaud(n));
+                            } else {
+                                out.push(Action.Show("\r\n*** invalid baud rate\r\n"));
+                            }
+                        },
+                        Option.None => out.push(Action.Show("\r\n*** cancelled\r\n")),
+                    }
+                } else if (b == 0x1B || b == 0x03) {
+                    m = Mode.Normal;
+                    out.push(Action.Show("\r\n*** cancelled\r\n"));
+                }
+            },
+        }
+    }
+    flush(out, pending);
+    return (m, out);
+}
+
+fn flush(out: [Action], pending: [int]) {
+    if (pending.len() > 0) {
+        out.push(Action.Send(bytes_of(pending)));
+    }
+}

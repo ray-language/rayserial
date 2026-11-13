@@ -1,0 +1,226 @@
+//! The libc layer: every `extern` of rayserial lives here, plus the
+//! platform constants (macOS and Linux) the other modules need.
+//!
+//! Rules this module follows (raylang FFI contract, reference §13):
+//! - `ffi.errno()` is read right after the failing call, before any I/O.
+//! - Variadic C functions are out of contract. `ioctl` and `fcntl` ARE
+//!   variadic, and on arm64 macOS the variadic argument travels on the
+//!   stack: calling them through a fixed-arity extern passes garbage
+//!   (measured: EFAULT for `ioctl`, a silent no-op for `fcntl(F_SETFL)`).
+//!   On macOS we call Darwin's non-variadic syscall wrapper `__ioctl`
+//!   instead; we never need `fcntl` (ports are opened O_NONBLOCK).
+
+import std/ffi;
+
+extern "c" {
+    fn open(path: string, flags: int) -> int;
+    fn close(fd: int) -> int;
+    fn read(fd: int, buf: bytes, n: u64) -> int;
+    fn write(fd: int, buf: bytes, n: u64) -> int;
+    fn isatty(fd: int) -> int;
+    fn strerror(code: int) -> Option<string>;
+    fn tcgetattr(fd: int, t: bytes) -> int;
+    fn tcsetattr(fd: int, action: int, t: bytes) -> int;
+    fn tcflush(fd: int, queue: int) -> int;
+    fn tcdrain(fd: int) -> int;
+    fn tcsendbreak(fd: int, duration: int) -> int;
+    fn posix_openpt(flags: int) -> int;
+    fn grantpt(fd: int) -> int;
+    fn unlockpt(fd: int) -> int;
+    fn ptsname(fd: int) -> Option<string>;
+    fn opendir(path: string) -> Option<ptr>;
+    fn readdir(dir: ptr) -> Option<ptr>;
+    fn closedir(dir: ptr) -> int;
+    fn memcpy(dst: bytes, src: ptr, n: u64) -> ptr;
+    fn __ioctl(fd: int, request: u64, arg: bytes) -> int;
+    fn ioctl(fd: int, request: u64, arg: bytes) -> int;
+}
+
+// Darwin: the fixed-arity syscall stub behind the variadic ioctl(2).
+// Linux: the variadic one (AAPCS64/SysV pass the third argument in a
+// register either way, so a fixed-arity declaration is ABI-compatible).
+
+// poll(2) is the one call that waits: in a native binary `blocking` moves it
+// to the blocking pool so the worker thread is not held.
+extern "c" blocking {
+    fn poll(fds: bytes, n: u64, timeout_ms: int) -> int;
+}
+
+pub const POLLIN: int = 0x1;
+
+pub const POLLOUT: int = 0x4;
+
+pub const POLLERR: int = 0x8;
+
+pub const POLLHUP: int = 0x10;
+
+pub const POLLNVAL: int = 0x20;
+
+pub fn is_linux() -> bool {
+    platform() == "linux"
+}
+
+pub fn o_rdwr() -> int {
+    2
+}
+
+pub fn o_noctty() -> int {
+    if (is_linux()) { 0o400 } else { 0x20000 }
+}
+
+pub fn o_nonblock() -> int {
+    if (is_linux()) { 0o4000 } else { 0x4 }
+}
+
+pub fn o_cloexec() -> int {
+    if (is_linux()) { 0o2000000 } else { 0x1000000 }
+}
+
+pub fn eagain() -> int {
+    if (is_linux()) { 11 } else { 35 }
+}
+
+pub const EINTR: int = 4;
+
+pub const EIO: int = 5;
+
+pub const ENOTTY: int = 25;
+
+/// `what: <strerror> (errno N)` for the errno already read by the caller.
+pub fn describe(what: string, code: int) -> string {
+    "${what}: ${strerror(code).unwrap_or("error")} (errno ${code})"
+}
+
+/// The errno of the call that just failed, as a message.
+pub fn last_error(what: string) -> string {
+    let code = ffi.errno();
+    describe(what, code)
+}
+
+/// errno as it is now (call it right after the failing extern).
+pub fn errno_now() -> int {
+    ffi.errno()
+}
+
+/// ioctl with a pointer argument, through the right symbol per platform.
+pub fn ioctl_ptr(fd: int, request: int, arg: bytes) -> Result<int, string> {
+    let r = if (is_linux()) {
+        ioctl(fd, request as u64, arg)
+    } else {
+        __ioctl(fd, request as u64, arg)
+    };
+    if (r < 0) { Result.Err(last_error("ioctl")) } else { Result.Ok(r) }
+}
+
+/// The errno code of the last failed ioctl_ptr-style call, for callers that
+/// branch on it (ENOTTY = the device does not do that).
+pub fn ioctl_code(fd: int, request: int, arg: bytes) -> int {
+    let r = if (is_linux()) {
+        ioctl(fd, request as u64, arg)
+    } else {
+        __ioctl(fd, request as u64, arg)
+    };
+    if (r < 0) { ffi.errno() } else { 0 }
+}
+
+pub fn le16(v: int) -> [int] {
+    [v & 255, (v >> 8) & 255]
+}
+
+pub fn le32(v: int) -> [int] {
+    [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255]
+}
+
+pub fn read_le(b: bytes, off: int, width: int) -> int {
+    var v = 0;
+    var i = width - 1;
+    while (i >= 0) {
+        v = (v << 8) | b[off + i];
+        i = i - 1;
+    }
+    v
+}
+
+/// One poll(2) over `fds` (each with its `events` mask). Returns the revents
+/// per fd; an empty array means the timeout passed. EINTR counts as timeout.
+pub fn poll_fds(fds: [int], events: [int], timeout_ms: int) -> Result<[int], string> {
+    var raw: [int] = [];
+    for i in 0..fds.len() {
+        raw = raw + le32(fds[i]) + le16(events[i]) + [0, 0];
+    }
+    let buf = bytes_of(raw);
+    let n = poll(buf, fds.len() as u64, timeout_ms);
+    if (n < 0) {
+        let code = ffi.errno();
+        if (code == EINTR) {
+            return Result.Ok([]);
+        }
+        return Result.Err(describe("poll", code));
+    }
+    if (n == 0) {
+        return Result.Ok([]);
+    }
+    var out: [int] = [];
+    for i in 0..fds.len() {
+        out.push(read_le(buf, i * 8 + 6, 2));
+    }
+    Result.Ok(out)
+}
+
+/// The result of one non-blocking read.
+pub enum Chunk {
+    Data(bytes),
+    Again,
+    Eof,
+    Failed(int, string),
+}
+
+/// read(2) once, up to `max` octets.
+pub fn read_chunk(fd: int, max: int) -> Chunk {
+    let buf = ffi.buffer(max);
+    let n = read(fd, buf, max as u64);
+    if (n > 0) {
+        return Chunk.Data(buf.sub_bytes(0, n));
+    }
+    if (n == 0) {
+        return Chunk.Eof;
+    }
+    let code = ffi.errno();
+    if (code == eagain() || code == EINTR) {
+        return Chunk.Again;
+    }
+    Chunk.Failed(code, describe("read", code))
+}
+
+/// Writes every octet of `data` to a (possibly non-blocking) fd, waiting
+/// with poll(POLLOUT) when the kernel queue is full. Gives up after
+/// `stall_ms` without progress.
+pub fn write_all(fd: int, data: bytes, stall_ms: int) -> Result<int, string> {
+    var off = 0;
+    let total = data.len();
+    while (off < total) {
+        let part = if (off == 0) { data } else { data.sub_bytes(off, total) };
+        let n = write(fd, part, part.len() as u64);
+        if (n > 0) {
+            off = off + n;
+            continue;
+        }
+        let code = if (n < 0) { ffi.errno() } else { eagain() };
+        if (code != eagain() && code != EINTR) {
+            return Result.Err(describe("write", code));
+        }
+        let ready = poll_fds([fd], [POLLOUT], stall_ms)?;
+        if (ready.len() == 0) {
+            return Result.Err("write: no progress for ${stall_ms} ms (peer not reading?)");
+        }
+    }
+    Result.Ok(total)
+}
+
+pub fn close_fd(fd: int) {
+    close(fd);
+}
+
+pub fn is_a_tty(fd: int) -> bool {
+    isatty(fd) == 1
+}

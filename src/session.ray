@@ -1,0 +1,191 @@
+//! `rayserial open`: the interactive terminal. One poll(2) loop over the
+//! local terminal (fd 0) and the port; the local tty is put in raw mode
+//! with std/term for the whole session (restored on every exit path).
+
+import keys;
+import port;
+import sys;
+import termios;
+import view;
+import std/io;
+import std/term;
+import std/time;
+from keys import Action, Mode;
+from port import Port;
+
+pub struct SessionOptions {
+    echo: bool,
+    crlf: bool,
+    hex: bool,
+    quiet: bool,
+    for_ms: int,
+}
+
+/// Mutable state of a session.
+struct State {
+    mode: Mode,
+    hex: bool,
+    hex_col: int,
+    prev_cr: bool,
+    stdin_open: bool,
+    quit: bool,
+    sent: int,
+    received: int,
+}
+
+fn say(s: string) {
+    let _ = io.write(s);
+    let _ = io.flush();
+}
+
+fn status_line(p: Port) -> string {
+    let live = match (port.current(p.fd)) {
+        Result.Ok(c) => termios.summary(c),
+        Result.Err(e) => e,
+    };
+    "*** ${p.path}: ${live} (speed via ${p.speed_note}) DTR=${on_off(p.dtr)} RTS=${on_off(p.rts)}"
+}
+
+fn on_off(b: bool) -> string {
+    if (b) { "on" } else { "off" }
+}
+
+/// Shows octets from the port on the local terminal.
+fn show(st: State, b: bytes, o: SessionOptions) {
+    st.received = st.received + b.len();
+    if (st.hex) {
+        let (text, col) = view.hex_feed(st.hex_col, b);
+        st.hex_col = col;
+        say(text);
+        return;
+    }
+    var out = b;
+    if (o.crlf) {
+        let (conv, cr) = view.lf_to_crlf(st.prev_cr, b);
+        out = conv;
+        st.prev_cr = cr;
+    }
+    let _ = io.write_bytes(out);
+    let _ = io.flush();
+}
+
+fn act(p: Port, st: State, a: Action, o: SessionOptions) -> Result<int, string> {
+    match (a) {
+        Action.Send(b) => {
+            sys.write_all(p.fd, b, 5000)?;
+            st.sent = st.sent + b.len();
+            if (o.echo) {
+                show_local_echo(st, b, o);
+            }
+        },
+        Action.Quit => st.quit = true,
+        Action.SetBaud(n) => match (port.set_baud(p, n)) {
+            Result.Ok(how) => say("*** baud ${n} (${how})\r\n"),
+            Result.Err(e) => say("*** baud ${n} refused: ${e}\r\n"),
+        },
+        Action.ToggleHex => {
+            st.hex = !st.hex;
+            st.hex_col = 0;
+            say("\r\n*** hex view ${on_off(st.hex)}\r\n");
+        },
+        Action.ToggleDtr => match (port.set_dtr(p, !p.dtr)) {
+            Result.Ok(how) => say("\r\n*** DTR ${on_off(p.dtr)} (${how})\r\n"),
+            Result.Err(e) => say("\r\n*** DTR: ${e}\r\n"),
+        },
+        Action.ToggleRts => match (port.set_rts(p, !p.rts)) {
+            Result.Ok(how) => say("\r\n*** RTS ${on_off(p.rts)} (${how})\r\n"),
+            Result.Err(e) => say("\r\n*** RTS: ${e}\r\n"),
+        },
+        Action.PulseDtr => match (port.pulse_dtr(p, 100)) {
+            Result.Ok(how) => say("\r\n*** DTR pulsed 100 ms (${how})\r\n"),
+            Result.Err(e) => say("\r\n*** DTR pulse: ${e}\r\n"),
+        },
+        Action.Break => match (port.send_break(p)) {
+            Result.Ok(_) => say("\r\n*** break sent\r\n"),
+            Result.Err(e) => say("\r\n*** break: ${e}\r\n"),
+        },
+        Action.Status => say("\r\n${status_line(p)} sent=${st.sent} received=${st.received}\r\n"),
+        Action.Help => say(keys.HELP),
+        Action.Show(s) => say(s),
+    }
+    Result.Ok(0)
+}
+
+fn show_local_echo(st: State, b: bytes, o: SessionOptions) {
+    let saved = st.received;
+    show(st, b, o);
+    st.received = saved;
+}
+
+/// The loop. Ends on Ctrl-A x, on --for, when the port goes away, or when
+/// stdin ends (only if it is not a terminal: `echo cmd | rayserial open`).
+fn pump(p: Port, o: SessionOptions) -> Result<int, string> {
+    let st = State {
+        mode: Mode.Normal,
+        hex: o.hex,
+        hex_col: 0,
+        prev_cr: false,
+        stdin_open: true,
+        quit: false,
+        sent: 0,
+        received: 0
+    };
+    let start = time.monotonic_millis();
+    while (!st.quit) {
+        if (o.for_ms > 0 && time.monotonic_millis() - start >= o.for_ms) {
+            break;
+        }
+        if (!st.stdin_open && o.for_ms <= 0) {
+            break;
+        }
+        let fds = if (st.stdin_open) { [p.fd, 0] } else { [p.fd] };
+        let evs = if (st.stdin_open) { [sys.POLLIN, sys.POLLIN] } else { [sys.POLLIN] };
+        let ready = sys.poll_fds(fds, evs, 100)?;
+        if (ready.len() == 0) {
+            continue;
+        }
+        if ((ready[0] & (sys.POLLIN | sys.POLLHUP | sys.POLLERR)) != 0) {
+            match (sys.read_chunk(p.fd, 4096)) {
+                sys.Chunk.Data(b) => show(st, b, o),
+                sys.Chunk.Again => { },
+                sys.Chunk.Eof => return Result.Err("the port closed"),
+                sys.Chunk.Failed(_, msg) => return Result.Err("the port went away (${msg})"),
+            }
+        }
+        if (st.stdin_open && (ready[1] & (sys.POLLIN | sys.POLLHUP)) != 0) {
+            match (sys.read_chunk(0, 1024)) {
+                sys.Chunk.Data(b) => {
+                    let (m, actions) = keys.feed(st.mode, b, o.crlf);
+                    st.mode = m;
+                    for a in actions {
+                        act(p, st, a, o)?;
+                    }
+                },
+                sys.Chunk.Again => { },
+                sys.Chunk.Eof => st.stdin_open = false,
+                sys.Chunk.Failed(_, _) => st.stdin_open = false,
+            }
+        }
+    }
+    Result.Ok(st.sent)
+}
+
+/// Runs the session; the local terminal is raw while it lasts (when stdin
+/// is a terminal at all).
+pub fn run(p: Port, o: SessionOptions) -> Result<int, string> {
+    if (!o.quiet) {
+        say("${status_line(p)}\r\n*** Ctrl-A x quits, Ctrl-A ? lists the keys\r\n");
+    }
+    let r = if (term.is_tty(0)) {
+        match (term.raw(fn() -> Result<int, string> { pump(p, o) })) {
+            Result.Ok(inner) => inner,
+            Result.Err(e) => Result.Err("raw mode: ${e}"),
+        }
+    } else {
+        pump(p, o)
+    };
+    if (!o.quiet) {
+        say("\r\n*** rayserial: bye\r\n");
+    }
+    r
+}

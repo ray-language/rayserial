@@ -1,0 +1,88 @@
+//! How received octets are shown on the local terminal: as they come
+//! (optionally turning a bare LF into CR LF, since the raw tty has no
+//! OPOST), or as a hex dump that keeps its column across bursts.
+
+/// Hex view state: octets already on the current row.
+pub const HEX_ROW: int = 16;
+
+const DIGITS: string = "0123456789abcdef";
+
+pub fn hex2(b: int) -> string {
+    "${DIGITS[(b >> 4) & 15]}${DIGITS[b & 15]}"
+}
+
+/// Renders `chunk` as hex continuing at column `col` (octets already on the
+/// row); returns the text and the new column. Rows end with an ASCII
+/// gutter-less CR LF every HEX_ROW octets.
+pub fn hex_feed(col: int, chunk: bytes) -> (string, int) {
+    var parts: [string] = [];
+    var c = col;
+    for b in chunk {
+        parts.push(hex2(b));
+        c = c + 1;
+        if (c == HEX_ROW) {
+            parts.push("\r\n");
+            c = 0;
+        } else {
+            parts.push(" ");
+        }
+    }
+    return (parts.join(""), c);
+}
+
+/// LF without a CR right before it becomes CR LF. `prev_cr` carries the
+/// last octet of the previous burst. Returns the bytes and the new flag.
+pub fn lf_to_crlf(prev_cr: bool, chunk: bytes) -> (bytes, bool) {
+    var has_lf = false;
+    for b in chunk {
+        if (b == 0x0A) {
+            has_lf = true;
+        }
+    }
+    let n = chunk.len();
+    let last_cr = if (n == 0) { prev_cr } else { chunk[n - 1] == 0x0D };
+    if (!has_lf) {
+        return (chunk, last_cr);
+    }
+    var out: [int] = [];
+    var before_cr = prev_cr;
+    for b in chunk {
+        if (b == 0x0A && !before_cr) {
+            out.push(0x0D);
+        }
+        out.push(b);
+        before_cr = b == 0x0D;
+    }
+    return (bytes_of(out), last_cr);
+}
+
+/// Bytes as a latin-1 string: one char per octet, so text searches and
+/// regexes see byte offsets.
+pub fn latin1(b: bytes) -> string {
+    var cs: [char] = [];
+    for x in b {
+        cs.push(char_from_code(x).unwrap_or('?'));
+    }
+    cs.chars_to_string(0, cs.len())
+}
+
+/// A printable rendering for logs and error messages: \r \n \t and \xNN.
+pub fn escaped(b: bytes) -> string {
+    var parts: [string] = [];
+    for x in b {
+        if (x == 0x0D) {
+            parts.push("\\r");
+        } else if (x == 0x0A) {
+            parts.push("\\n");
+        } else if (x == 0x09) {
+            parts.push("\\t");
+        } else if (x == 0x5C) {
+            parts.push("\\\\");
+        } else if (x >= 0x20 && x < 0x7F) {
+            parts.push("${char_from_code(x).unwrap_or('?')}");
+        } else {
+            parts.push("\\x${hex2(x)}");
+        }
+    }
+    parts.join("")
+}
